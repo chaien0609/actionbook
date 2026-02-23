@@ -301,10 +301,32 @@ fn handle_existing_config(cli: &Cli, non_interactive: bool, reset: bool) -> Resu
     }
 }
 
+/// Return setup logo symbol. Prefer natural-join on UTF-8 terminals.
+fn setup_logo_symbol() -> &'static str {
+    let locale_candidates = [
+        std::env::var("LC_ALL").ok(),
+        std::env::var("LC_CTYPE").ok(),
+        std::env::var("LANG").ok(),
+    ];
+
+    for locale in locale_candidates.into_iter().flatten() {
+        let upper = locale.to_uppercase();
+        if upper.contains("UTF-8") || upper.contains("UTF8") {
+            return "⋈";
+        }
+    }
+
+    "><"
+}
+
 /// Print the welcome banner.
 fn print_welcome() {
     println!();
-    println!("  {}  {}", "⋈".cyan().bold(), "Actionbook".bold());
+    println!(
+        "  {}  {}",
+        setup_logo_symbol().cyan().bold(),
+        "Actionbook".bold()
+    );
     println!();
     println!(
         "  {}  {}  {}",
