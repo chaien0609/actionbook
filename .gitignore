@@ -72,6 +72,7 @@ handbooks/
 
 # Browser Profile (Sensitive Session Data)
 .browser-profile/
-
-.docs/
+.alma-snapshots
+*.difypkg
+.coverage
 store-assets/

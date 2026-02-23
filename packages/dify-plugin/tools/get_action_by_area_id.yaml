@@ -1,0 +1,63 @@
+identity:
+  name: get_action_by_area_id
+  author: actionbook
+  label:
+    en_US: Get Action Details
+    zh_Hans: 获取操作详情
+description:
+  human:
+    en_US: >
+      Retrieve full action details by area ID.
+      Returns complete selector information (CSS, XPath, ARIA),
+      allowed interaction methods, and element structure.
+    zh_Hans: >
+      通过 Area ID 获取完整的操作详情。
+      返回选择器信息（CSS、XPath、ARIA）、
+      允许的交互方法和元素结构。
+  llm: >
+    Get the complete action manual for a specific website element.
+    Returns detailed CSS/XPath selectors and interaction instructions
+    that you can use directly for browser automation.
+
+    IMPORTANT: You must call "search_actions" FIRST to find the area ID,
+    then pass it to this tool. Do NOT guess area IDs.
+
+    WORKFLOW:
+    1. Call "search_actions" with a keyword (e.g., "github login").
+    2. Pick the best matching area ID from the search results.
+    3. Call this tool with that area ID.
+    4. Use the returned CSS/XPath selectors to interact with the page.
+
+    The response includes:
+    - Page URL and structure
+    - UI element details (type, description)
+    - Multiple selectors (CSS, XPath, ARIA) with confidence scores
+    - Allowed interaction methods (click, type, select, etc.)
+
+    FALLBACK: If the returned selectors fail (element not found, page changed),
+    use browser_operator with action=snapshot to get the current page's
+    accessibility tree and derive fresh selectors from it.
+parameters:
+  - name: area_id
+    type: string
+    required: true
+    label:
+      en_US: Area ID
+      zh_Hans: Area ID
+    human_description:
+      en_US: >
+        Area ID from search_actions results.
+        Format: "site:path:area" (e.g., "github.com:login:email-input")
+      zh_Hans: >
+        来自 search_actions 结果的 Area ID。
+        格式："site:path:area"（如 "github.com:login:email-input"）
+    llm_description: >
+      The area ID obtained from search_actions results.
+      Format is "site:path:area".
+      Examples: "github.com:login:email-input",
+      "arxiv.org:/search/advanced:default".
+      You MUST call search_actions first to get valid area IDs.
+    form: llm
+extra:
+  python:
+    source: tools/get_action_by_area_id.py
