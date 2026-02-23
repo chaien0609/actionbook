@@ -301,22 +301,10 @@ fn handle_existing_config(cli: &Cli, non_interactive: bool, reset: bool) -> Resu
     }
 }
 
-/// Print the welcome banner with gradient Actionbook logo.
+/// Print the welcome banner.
 fn print_welcome() {
     println!();
-    let lines = [
-        r"     _        _   _             _                 _     ",
-        r"    / \   ___| |_(_) ___  _ __ | |__   ___   ___ | | __ ",
-        r"   / _ \ / __| __| |/ _ \| '_ \| '_ \ / _ \ / _ \| |/ /",
-        r"  / ___ \ (__| |_| | (_) | | | | |_) | (_) | (_) |   < ",
-        r" /_/   \_\___|\__|_|\___/|_| |_|_.__/ \___/ \___/|_|\_\",
-    ];
-    // Gradient: bright_cyan → cyan → blue
-    println!("  {}", lines[0].bright_cyan().bold());
-    println!("  {}", lines[1].bright_cyan());
-    println!("  {}", lines[2].cyan());
-    println!("  {}", lines[3].cyan());
-    println!("  {}", lines[4].blue());
+    println!("  {}  {}", "⋈".cyan().bold(), "Actionbook".bold());
     println!();
     println!(
         "  {}  {}  {}",
