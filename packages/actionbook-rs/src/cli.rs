@@ -162,8 +162,9 @@ pub enum Commands {
     },
 
     /// Initial setup wizard
+    #[command(after_help = "Agent-friendly non-interactive examples:\n  actionbook setup --non-interactive --target codex --browser isolated --api-key $ACTIONBOOK_API_KEY --json\n  actionbook setup --non-interactive --target claude --browser extension --json\n\nTips:\n  --target selects skill installation target agent type.\n  --non-interactive disables prompts (agent-safe).\n  --json emits machine-readable setup results.")]
     Setup {
-        /// Target platform (skip wizard, run `npx skills add` for specific agent)
+        /// Skill installation target agent type. If used alone, runs quick install (`npx skills add`) and exits.
         #[arg(short, long, value_enum)]
         target: Option<SetupTarget>,
 
@@ -171,17 +172,18 @@ pub enum Commands {
         #[arg(long, env = "ACTIONBOOK_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
 
-        /// Browser mode
+        /// Browser mode for setup flow (e.g. with --non-interactive)
         #[arg(long, value_enum)]
         browser: Option<BrowserMode>,
 
-        /// Skip interactive prompts
+        /// Run setup without interactive prompts (agent-safe)
         #[arg(long)]
         non_interactive: bool,
 
         /// Reset existing configuration and start fresh
         #[arg(long)]
         reset: bool,
+
     },
 }
 

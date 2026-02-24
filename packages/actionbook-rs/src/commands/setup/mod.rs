@@ -26,25 +26,44 @@ pub struct SetupArgs<'a> {
     pub reset: bool,
 }
 
+fn should_run_target_only(args: &SetupArgs<'_>) -> bool {
+    args.target.is_some()
+        && args.api_key.is_none()
+        && args.browser.is_none()
+        && !args.non_interactive
+        && !args.reset
+}
+
+
+fn should_install_skills_for_target(target: Option<SetupTarget>) -> bool {
+    !matches!(target, Some(SetupTarget::Standalone))
+}
+
+
+
 /// Run the setup wizard. Orchestrates all steps in order.
 ///
 /// Quick mode: if `--target` is provided without other flags, only run
 /// `npx skills add` for the specified target, skipping the full wizard.
 pub async fn run(cli: &Cli, args: SetupArgs<'_>) -> Result<()> {
     // Quick mode: --target only → run npx skills add and exit
-    if let Some(t) = args.target {
-        return run_target_only(cli, t).await;
+    if should_run_target_only(&args) {
+        return run_target_only(cli, args.target.expect("target exists in quick mode")).await;
     }
 
+    // In full setup flow, use --target to select skills installation target.
+    let agent_target = args.target;
+    let effective_non_interactive = args.non_interactive;
+
     // Handle existing config (re-run protection)
-    let mut config = handle_existing_config(cli, args.non_interactive, args.reset)?;
+    let mut config = handle_existing_config(cli, effective_non_interactive, args.reset)?;
 
     // Step 1: Welcome + environment detection
     if !cli.json {
         print_welcome();
         print_step_header(1, "Environment");
     }
-    let spinner = create_spinner(cli.json, args.non_interactive, "Scanning environment...");
+    let spinner = create_spinner(cli.json, effective_non_interactive, "Scanning environment...");
     let env = detect::detect_environment();
     finish_spinner(spinner, "Environment detected");
     detect::print_environment_report(&env, cli.json);
@@ -52,13 +71,15 @@ pub async fn run(cli: &Cli, args: SetupArgs<'_>) -> Result<()> {
         print_step_connector();
     }
 
+    let browser_flag = args.browser;
+
     // Steps 2–4: configure → recap → save (with restart loop)
     let config = loop {
         // Step 2: API Key
         if !cli.json {
             print_step_header(2, "API Key");
         }
-        api_key::configure_api_key(cli, &env, args.api_key, args.non_interactive, &mut config)
+        api_key::configure_api_key(cli, &env, args.api_key, effective_non_interactive, &mut config)
             .await?;
 
         // Step 3: Browser
@@ -66,7 +87,7 @@ pub async fn run(cli: &Cli, args: SetupArgs<'_>) -> Result<()> {
             print_step_connector();
             print_step_header(3, "Browser");
         }
-        browser_cfg::configure_browser(cli, &env, args.browser, args.non_interactive, &mut config).await?;
+        browser_cfg::configure_browser(cli, &env, browser_flag, effective_non_interactive, &mut config).await?;
 
         // Step 4: Save configuration
         if !cli.json {
@@ -75,7 +96,7 @@ pub async fn run(cli: &Cli, args: SetupArgs<'_>) -> Result<()> {
         }
 
         // Show recap (interactive only)
-        if !cli.json && !args.non_interactive {
+        if !cli.json && !effective_non_interactive {
             let bar = "│".dimmed();
             let api_display = config
                 .api
@@ -119,14 +140,33 @@ pub async fn run(cli: &Cli, args: SetupArgs<'_>) -> Result<()> {
         print_step_connector();
         print_step_header(5, "Health Check");
     }
-    run_health_check(cli, &config, args.non_interactive).await;
+    run_health_check(cli, &config, effective_non_interactive).await;
 
     // Step 6: Install Skills
-    if !cli.json {
-        print_step_connector();
-        print_step_header(6, "Skills");
-    }
-    let skills_result = mode::install_skills(cli, &env, args.non_interactive)?;
+    let skills_result = if should_install_skills_for_target(agent_target) {
+        if !cli.json {
+            print_step_connector();
+            print_step_header(6, "Skills");
+        }
+        mode::install_skills(cli, &env, effective_non_interactive, agent_target.as_ref())?
+    } else {
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "step": "skills",
+                    "npx_available": true,
+                    "action": "skipped",
+                    "reason": "standalone_target",
+                })
+            );
+        }
+        mode::SkillsResult {
+            npx_available: true,
+            action: mode::SkillsAction::Skipped,
+            command: "npx skills add actionbook/actionbook".to_string(),
+        }
+    };
 
     // Completion summary
     print_completion(cli, &config, &skills_result);
@@ -579,4 +619,48 @@ fn shorten_browser_path(path: &str) -> String {
     }
     // Fallback: last path component
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_args<'a>() -> SetupArgs<'a> {
+        SetupArgs {
+            target: None,
+            api_key: None,
+            browser: None,
+            non_interactive: false,
+            reset: false,
+        }
+    }
+
+    #[test]
+    fn target_only_triggers_quick_mode() {
+        let mut args = base_args();
+        args.target = Some(SetupTarget::Codex);
+        assert!(should_run_target_only(&args));
+    }
+
+    #[test]
+    fn target_with_non_interactive_runs_full_setup() {
+        let mut args = base_args();
+        args.target = Some(SetupTarget::Codex);
+        args.non_interactive = true;
+        assert!(!should_run_target_only(&args));
+    }
+
+    #[test]
+    fn target_with_browser_runs_full_setup() {
+        let mut args = base_args();
+        args.target = Some(SetupTarget::Codex);
+        args.browser = Some(BrowserMode::Isolated);
+        assert!(!should_run_target_only(&args));
+    }
+
+    #[test]
+    fn standalone_target_skips_skills_install() {
+        assert!(!should_install_skills_for_target(Some(SetupTarget::Standalone)));
+    }
+
 }
