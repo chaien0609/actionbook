@@ -1,8 +1,14 @@
+pub mod act;
+pub mod batch;
 pub mod browser;
 pub mod config;
+pub mod execute;
 pub mod extension;
 pub mod get;
 pub mod profile;
+pub mod record;
+pub mod replay;
 pub mod search;
 pub mod setup;
 pub mod sources;
+pub mod validate;

@@ -217,7 +217,7 @@ impl SessionManager {
     ) -> Result<(Browser, Handler)> {
         let stealth_enabled = self.is_stealth_enabled();
 
-        let launcher =
+        let mut launcher =
             BrowserLauncher::from_profile(profile_name, profile)?.with_stealth(stealth_enabled);
 
         let (_child, cdp_url) = launcher.launch_and_wait().await?;
@@ -489,8 +489,8 @@ impl SessionManager {
         Err(ActionbookError::Other("No response received".to_string()))
     }
 
-    /// Helper to send a CDP command and get response
-    async fn send_cdp_command(
+    /// Helper to send a CDP command and get response (public for snapshot/blocking)
+    pub async fn send_cdp_command(
         &self,
         profile_name: Option<&str>,
         method: &str,
@@ -1198,6 +1198,31 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Dispatch a single character key event (for human-like typing)
+    pub async fn dispatch_key_char(&self, profile_name: Option<&str>, ch: char) -> Result<()> {
+        let text = ch.to_string();
+        self.send_cdp_command(
+            profile_name,
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": "keyDown",
+                "key": &text,
+                "text": &text,
+            }),
+        )
+        .await?;
+        self.send_cdp_command(
+            profile_name,
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": "keyUp",
+                "key": &text,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Get page HTML
     pub async fn get_html(
         &self,
@@ -1490,6 +1515,494 @@ impl SessionManager {
             }
         }
     }
+
+    // ========== G5: Fingerprint Rotation ==========
+
+    /// Generate and apply a new browser fingerprint dynamically.
+    /// Updates UA, platform, screen dimensions, hardware concurrency, and device memory.
+    pub async fn rotate_fingerprint(
+        &self,
+        profile_name: Option<&str>,
+        fingerprint: &super::stealth_enhanced::EnhancedStealthProfile,
+    ) -> Result<()> {
+        // 1. Set User-Agent override via Emulation
+        self.send_cdp_command(
+            profile_name,
+            "Emulation.setUserAgentOverride",
+            serde_json::json!({
+                "userAgent": fingerprint.user_agent,
+                "platform": fingerprint.platform,
+                "acceptLanguage": fingerprint.language,
+            }),
+        )
+        .await?;
+
+        // 2. Inject screen/hardware overrides via JS
+        let screen_js = format!(
+            r#"(function() {{
+                Object.defineProperty(screen, 'width', {{ get: () => {} }});
+                Object.defineProperty(screen, 'height', {{ get: () => {} }});
+                Object.defineProperty(screen, 'availWidth', {{ get: () => {} }});
+                Object.defineProperty(screen, 'availHeight', {{ get: () => {} }});
+                Object.defineProperty(screen, 'colorDepth', {{ get: () => {} }});
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {} }});
+                Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {} }});
+            }})()"#,
+            fingerprint.screen_width,
+            fingerprint.screen_height,
+            fingerprint.avail_width,
+            fingerprint.avail_height,
+            fingerprint.color_depth,
+            fingerprint.hardware_concurrency,
+            fingerprint.device_memory,
+        );
+
+        self.eval_on_page(profile_name, &screen_js).await?;
+
+        // 3. Register for future pages too
+        self.send_cdp_command(
+            profile_name,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": &screen_js }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== G2: Global Animation Disabling ==========
+
+    /// Disable all CSS animations and transitions on the current and future pages.
+    /// Injects CSS via `Page.addScriptToEvaluateOnNewDocument` and applies
+    /// `Emulation.setEmulatedMedia` with `prefers-reduced-motion: reduce`.
+    pub async fn disable_animations(&self, profile_name: Option<&str>) -> Result<()> {
+        let css = r#"*, *::before, *::after { animation: none !important; animation-duration: 0s !important; transition: none !important; transition-duration: 0s !important; scroll-behavior: auto !important; }"#;
+
+        let inject_js = format!(
+            r#"(function() {{ var s = document.createElement('style'); s.textContent = {}; document.head.appendChild(s); }})()"#,
+            serde_json::to_string(css).unwrap_or_default()
+        );
+
+        // 1. Inject CSS on current page immediately
+        self.eval_on_page(profile_name, &inject_js).await?;
+
+        // 2. Register script for all future page loads
+        self.send_cdp_command(
+            profile_name,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": &inject_js }),
+        )
+        .await?;
+
+        // 3. Set prefers-reduced-motion media feature
+        self.send_cdp_command(
+            profile_name,
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({
+                "features": [
+                    { "name": "prefers-reduced-motion", "value": "reduce" }
+                ]
+            }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== F3: Resource Blocking ==========
+
+    /// Block resource loading by URL patterns via CDP Network.setBlockedURLs
+    pub async fn set_resource_blocking(
+        &self,
+        profile_name: Option<&str>,
+        level: ResourceBlockLevel,
+    ) -> Result<()> {
+        let patterns = level.patterns();
+        if patterns.is_empty() {
+            return Ok(());
+        }
+
+        // Enable Network domain first
+        self.send_cdp_command(profile_name, "Network.enable", serde_json::json!({}))
+            .await?;
+
+        self.send_cdp_command(
+            profile_name,
+            "Network.setBlockedURLs",
+            serde_json::json!({ "urls": patterns }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== F4: Readability Text Extraction ==========
+
+    /// Get readable text content from the page using readability extraction
+    pub async fn get_readable_text(
+        &self,
+        profile_name: Option<&str>,
+        mode: TextExtractionMode,
+    ) -> Result<String> {
+        let js = match mode {
+            TextExtractionMode::Raw => "document.body.innerText".to_string(),
+            TextExtractionMode::Readability => {
+                super::readability::READABILITY_JS.to_string()
+            }
+        };
+
+        let result = self.eval_on_page(profile_name, &js).await?;
+        Ok(result.as_str().unwrap_or("").to_string())
+    }
+
+    // ========== F1: CDP Accessibility Tree ==========
+
+    /// Get the full accessibility tree via CDP Accessibility.getFullAXTree
+    pub async fn get_accessibility_tree(
+        &self,
+        profile_name: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.send_cdp_command(
+            profile_name,
+            "Accessibility.getFullAXTree",
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Get the backendNodeId of an element matching a CSS selector
+    pub async fn get_backend_node_id(
+        &self,
+        profile_name: Option<&str>,
+        selector: &str,
+    ) -> Result<Option<i64>> {
+        // Get document root
+        let doc = self
+            .send_cdp_command(profile_name, "DOM.getDocument", serde_json::json!({}))
+            .await?;
+        let root_id = doc
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(|n| n.as_i64())
+            .unwrap_or(1);
+
+        // Query selector
+        let result = self
+            .send_cdp_command(
+                profile_name,
+                "DOM.querySelector",
+                serde_json::json!({ "nodeId": root_id, "selector": selector }),
+            )
+            .await?;
+        let node_id = result.get("nodeId").and_then(|n| n.as_i64()).unwrap_or(0);
+        if node_id == 0 {
+            return Ok(None);
+        }
+
+        // Describe node to get backendNodeId
+        let desc = self
+            .send_cdp_command(
+                profile_name,
+                "DOM.describeNode",
+                serde_json::json!({ "nodeId": node_id }),
+            )
+            .await?;
+        let backend_id = desc
+            .get("node")
+            .and_then(|n| n.get("backendNodeId"))
+            .and_then(|b| b.as_i64());
+
+        Ok(backend_id)
+    }
+
+    // ========== F2: Node-based actions ==========
+
+    /// Resolve a backendNodeId to a JS remote object, then call a function on it
+    pub async fn resolve_and_call(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+        function_declaration: &str,
+    ) -> Result<serde_json::Value> {
+        use futures::SinkExt;
+        use futures::stream::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let page_info = self.get_active_page_info(profile_name).await?;
+        let ws_url = page_info
+            .web_socket_debugger_url
+            .ok_or_else(|| ActionbookError::CdpConnectionFailed("No WebSocket URL".to_string()))?;
+
+        let (mut ws, _) = connect_async(&ws_url).await.map_err(|e| {
+            ActionbookError::CdpConnectionFailed(format!("WebSocket connection failed: {}", e))
+        })?;
+
+        // Helper to send a command and wait for its response on the same connection
+        async fn send_and_recv(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            id: u64,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            use futures::SinkExt;
+            use futures::stream::StreamExt;
+
+            let cmd = serde_json::json!({ "id": id, "method": method, "params": params });
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(cmd.to_string().into()))
+                .await
+                .map_err(|e| ActionbookError::Other(format!("Failed to send {}: {}", method, e)))?;
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        let response: serde_json::Value = serde_json::from_str(text.as_str())?;
+                        if response.get("id") == Some(&serde_json::json!(id)) {
+                            if let Some(error) = response.get("error") {
+                                return Err(ActionbookError::Other(format!("CDP error: {}", error)));
+                            }
+                            return Ok(response
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null));
+                        }
+                        // Not our response, skip (could be events)
+                    }
+                    Ok(_) => continue,
+                    Err(e) => return Err(ActionbookError::Other(format!("WebSocket error: {}", e))),
+                }
+            }
+            Err(ActionbookError::Other(format!("No response for {}", method)))
+        }
+
+        // All commands on the same WebSocket connection:
+        // 1. Enable DOM domain
+        let _ = send_and_recv(&mut ws, 1, "DOM.enable", serde_json::json!({})).await;
+        // 2. Get document root (populates internal DOM state)
+        let _ = send_and_recv(&mut ws, 2, "DOM.getDocument", serde_json::json!({})).await;
+        // 3. Resolve backendNodeId to remote object
+        let resolved = send_and_recv(
+            &mut ws, 3, "DOM.resolveNode",
+            serde_json::json!({ "backendNodeId": backend_node_id }),
+        ).await?;
+
+        let object_id = resolved
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| {
+                ActionbookError::ElementNotFound(format!(
+                    "Could not resolve backendNodeId {}",
+                    backend_node_id
+                ))
+            })?;
+
+        // 4. Call function on the resolved object
+        let result = send_and_recv(
+            &mut ws, 4, "Runtime.callFunctionOn",
+            serde_json::json!({
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "returnByValue": true,
+            }),
+        ).await?;
+
+        Ok(result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Get the center coordinates of an element by backendNodeId (scrolls into view)
+    pub async fn get_element_center_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+    ) -> Result<(f64, f64)> {
+        let coords = self
+            .resolve_and_call(
+                profile_name,
+                backend_node_id,
+                "function() { this.scrollIntoView({ behavior: 'instant', block: 'center' }); \
+                 const r = this.getBoundingClientRect(); \
+                 return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }",
+            )
+            .await?;
+        let x = coords.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = coords.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        Ok((x, y))
+    }
+
+    /// Get the center coordinates of an element by CSS selector (scrolls into view)
+    pub async fn get_element_center(
+        &self,
+        profile_name: Option<&str>,
+        selector: &str,
+    ) -> Result<(f64, f64)> {
+        let js = format!(
+            r#"(function() {{
+                var el = document.querySelector({sel});
+                if (!el) return null;
+                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                var r = el.getBoundingClientRect();
+                return {{ x: r.left + r.width / 2, y: r.top + r.height / 2 }};
+            }})()"#,
+            sel = serde_json::to_string(selector).unwrap_or_else(|_| format!("\"{}\"", selector))
+        );
+        let result = self.eval_on_page(profile_name, &js).await?;
+        let x = result.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = result.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        Ok((x, y))
+    }
+
+    /// Click an element by backendNodeId
+    pub async fn click_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+    ) -> Result<()> {
+        // Scroll into view and get coordinates
+        let (x, y) = self.get_element_center_by_node_id(profile_name, backend_node_id).await?;
+
+        // Dispatch click events
+        for event_type in &["mouseMoved", "mousePressed", "mouseReleased"] {
+            let mut params = serde_json::json!({ "type": event_type, "x": x, "y": y });
+            if *event_type != "mouseMoved" {
+                params["button"] = serde_json::json!("left");
+                params["clickCount"] = serde_json::json!(1);
+            }
+            self.send_cdp_command(profile_name, "Input.dispatchMouseEvent", params)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Focus an element by backendNodeId
+    pub async fn focus_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+    ) -> Result<()> {
+        self.send_cdp_command(
+            profile_name,
+            "DOM.focus",
+            serde_json::json!({ "backendNodeId": backend_node_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Type text into an element by backendNodeId (focus + dispatchKeyEvent)
+    pub async fn type_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        self.focus_by_node_id(profile_name, backend_node_id).await?;
+        for ch in text.chars() {
+            self.send_cdp_command(
+                profile_name,
+                "Input.dispatchKeyEvent",
+                serde_json::json!({
+                    "type": "keyDown",
+                    "text": ch.to_string(),
+                }),
+            )
+            .await?;
+            self.send_cdp_command(
+                profile_name,
+                "Input.dispatchKeyEvent",
+                serde_json::json!({ "type": "keyUp" }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Fill (clear + set value) an element by backendNodeId
+    pub async fn fill_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        self.focus_by_node_id(profile_name, backend_node_id).await?;
+        let text_json = serde_json::to_string(text)?;
+        self.resolve_and_call(
+            profile_name,
+            backend_node_id,
+            &format!(
+                "function() {{ this.value = {text_json}; \
+                 this.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+                 this.dispatchEvent(new Event('change', {{ bubbles: true }})); }}"
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ========== F5: Human-like input ==========
+
+    /// Dispatch a sequence of mouse move events following a bezier curve
+    pub async fn dispatch_mouse_moves(
+        &self,
+        profile_name: Option<&str>,
+        points: &[(f64, f64)],
+    ) -> Result<()> {
+        for (x, y) in points {
+            self.send_cdp_command(
+                profile_name,
+                "Input.dispatchMouseEvent",
+                serde_json::json!({ "type": "mouseMoved", "x": x, "y": y }),
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        }
+        Ok(())
+    }
+}
+
+/// Resource blocking level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceBlockLevel {
+    None,
+    Images,
+    Media,
+}
+
+impl ResourceBlockLevel {
+    fn patterns(&self) -> Vec<&'static str> {
+        match self {
+            Self::None => vec![],
+            Self::Images => vec![
+                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
+                "*.ico", "*.bmp", "*.avif", "*.jfif", "*.tiff",
+                "*imagedelivery.net*", "*images.unsplash.com*",
+            ],
+            Self::Media => vec![
+                // Images
+                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
+                "*.ico", "*.bmp", "*.avif", "*.jfif", "*.tiff",
+                "*imagedelivery.net*", "*images.unsplash.com*",
+                // Fonts
+                "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+                // Video/Audio
+                "*.mp4", "*.webm", "*.ogg", "*.mp3", "*.wav", "*.m3u8",
+                // CSS
+                "*.css",
+            ],
+        }
+    }
+}
+
+/// Text extraction mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextExtractionMode {
+    Raw,
+    Readability,
 }
 
 #[cfg(test)]

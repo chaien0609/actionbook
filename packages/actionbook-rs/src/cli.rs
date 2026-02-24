@@ -89,6 +89,18 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// Block image downloads (faster page loads)
+    #[arg(long, env = "ACTIONBOOK_BLOCK_IMAGES", global = true)]
+    pub block_images: bool,
+
+    /// Block images, fonts, CSS, and media (fastest page loads)
+    #[arg(long, env = "ACTIONBOOK_BLOCK_MEDIA", global = true)]
+    pub block_media: bool,
+
+    /// Disable CSS animations, transitions, and smooth scrolling on all pages
+    #[arg(long, env = "ACTIONBOOK_NO_ANIMATIONS", global = true)]
+    pub no_animations: bool,
+
     /// Use Camoufox browser backend
     #[arg(long, env = "ACTIONBOOK_CAMOFOX", global = true)]
     pub camofox: bool,
@@ -137,6 +149,36 @@ pub enum Commands {
         area_id: String,
     },
 
+    /// Show all executable elements and methods for an area
+    Act {
+        /// Area ID (e.g., "github.com:/login:default")
+        area_id: String,
+    },
+
+    /// Execute an action on a specific element within an area
+    Execute {
+        /// Area ID (e.g., "github.com:/login:default")
+        area_id: String,
+
+        /// Element ID within the area
+        element_id: String,
+
+        /// Method to execute (click, fill, type, select, hover, focus)
+        method: String,
+
+        /// Text value for fill/type methods
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Value for select method
+        #[arg(long)]
+        value: Option<String>,
+
+        /// Navigate to the page URL first
+        #[arg(long)]
+        navigate: bool,
+    },
+
     /// List or search sources
     Sources {
         #[command(subcommand)]
@@ -159,6 +201,37 @@ pub enum Commands {
     Extension {
         #[command(subcommand)]
         command: ExtensionCommands,
+    },
+
+    /// Record user browser actions into a scenario file
+    Record {
+        /// URL to navigate to and start recording
+        #[arg(long)]
+        url: String,
+
+        /// Output file path (default: stdout)
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Replay a recorded scenario file
+    Replay {
+        /// Path to scenario JSON file
+        file: String,
+
+        /// Show steps without executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Validate selectors for an area by testing them in the browser
+    Validate {
+        /// Area ID (e.g., "github.com:/login:default")
+        area_id: String,
+
+        /// Submit validation report to backend API
+        #[arg(long)]
+        report: bool,
     },
 
     /// Initial setup wizard
@@ -243,33 +316,53 @@ pub enum BrowserCommands {
 
     /// Click an element
     Click {
-        /// CSS selector
-        selector: String,
+        /// CSS selector (or use --ref for snapshot ref)
+        #[arg(required_unless_present = "ref")]
+        selector: Option<String>,
         /// Wait for element before clicking (ms), 0 to skip
         #[arg(long, default_value = "0")]
         wait: u64,
+        /// Snapshot ref (e.g., e0, e5) from last `browser snapshot`
+        #[arg(long, name = "ref")]
+        ref_id: Option<String>,
+        /// Use human-like bezier curve mouse movement
+        #[arg(long)]
+        human: bool,
     },
 
     /// Type text into an element (appends to existing)
     Type {
-        /// CSS selector
-        selector: String,
+        /// CSS selector (or use --ref for snapshot ref)
+        #[arg(required_unless_present = "ref")]
+        selector: Option<String>,
         /// Text to type
-        text: String,
+        #[arg(required_unless_present = "ref")]
+        text: Option<String>,
         /// Wait for element before typing (ms), 0 to skip
         #[arg(long, default_value = "0")]
         wait: u64,
+        /// Snapshot ref (e.g., e0, e5) from last `browser snapshot`
+        #[arg(long, name = "ref")]
+        ref_id: Option<String>,
+        /// Use human-like typing with natural delays and occasional typos
+        #[arg(long)]
+        human: bool,
     },
 
     /// Clear and type text into an element
     Fill {
-        /// CSS selector
-        selector: String,
+        /// CSS selector (or use --ref for snapshot ref)
+        #[arg(required_unless_present = "ref")]
+        selector: Option<String>,
         /// Text to fill
-        text: String,
+        #[arg(required_unless_present = "ref")]
+        text: Option<String>,
         /// Wait for element before filling (ms), 0 to skip
         #[arg(long, default_value = "0")]
         wait: u64,
+        /// Snapshot ref (e.g., e0, e5) from last `browser snapshot`
+        #[arg(long, name = "ref")]
+        ref_id: Option<String>,
     },
 
     /// Select an option from dropdown
@@ -330,10 +423,32 @@ pub enum BrowserCommands {
     Text {
         /// Get only text of selector (optional)
         selector: Option<String>,
+        /// Extraction mode: raw (innerText) or readability (smart extraction, default)
+        #[arg(long, default_value = "readability")]
+        mode: String,
     },
 
-    /// Get accessibility snapshot
-    Snapshot,
+    /// Get accessibility snapshot via CDP Accessibility Tree
+    Snapshot {
+        /// Only show interactive elements (buttons, links, inputs, etc.)
+        #[arg(long)]
+        filter: Option<String>,
+        /// Output format: compact, text, json (default: compact)
+        #[arg(long, default_value = "compact")]
+        format: String,
+        /// Maximum tree depth
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Scope to elements under this CSS selector
+        #[arg(long)]
+        selector: Option<String>,
+        /// Show diff from last snapshot (added/changed/removed)
+        #[arg(long)]
+        diff: bool,
+        /// Truncate output to approximately N tokens (for LLM context window management)
+        #[arg(long)]
+        max_tokens: Option<usize>,
+    },
 
     /// Inspect DOM element at coordinates
     Inspect {
@@ -364,6 +479,22 @@ pub enum BrowserCommands {
         smooth: bool,
     },
 
+    /// Execute a batch of actions from JSON (stdin or file)
+    Batch {
+        /// Path to JSON file with actions (reads from stdin if omitted)
+        #[arg(long)]
+        file: Option<String>,
+        /// Delay between steps in milliseconds
+        #[arg(long, default_value = "50")]
+        delay: u64,
+    },
+
+    /// Rotate browser fingerprint (UA, platform, screen, hardware)
+    Fingerprint {
+        #[command(subcommand)]
+        command: FingerprintCommands,
+    },
+
     /// Close the browser
     Close,
 
@@ -374,6 +505,19 @@ pub enum BrowserCommands {
     Connect {
         /// CDP endpoint (port or WebSocket URL)
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FingerprintCommands {
+    /// Generate and apply a new random fingerprint
+    Rotate {
+        /// Target OS: windows, mac, linux, random
+        #[arg(long, default_value = "random")]
+        os: String,
+        /// Target screen resolution (e.g., 1920x1080, random)
+        #[arg(long, default_value = "random")]
+        screen: String,
     },
 }
 
@@ -587,6 +731,35 @@ impl Cli {
                 .await
             }
             Commands::Get { area_id } => commands::get::run(self, area_id).await,
+            Commands::Act { area_id } => commands::act::run(self, area_id).await,
+            Commands::Execute {
+                area_id,
+                element_id,
+                method,
+                text,
+                value,
+                navigate,
+            } => {
+                commands::execute::run(
+                    self,
+                    area_id,
+                    element_id,
+                    method,
+                    text.as_deref(),
+                    value.as_deref(),
+                    *navigate,
+                )
+                .await
+            }
+            Commands::Record { url, output } => {
+                commands::record::run(self, url, output.as_deref()).await
+            }
+            Commands::Replay { file, dry_run } => {
+                commands::replay::run(self, file, *dry_run).await
+            }
+            Commands::Validate { area_id, report } => {
+                commands::validate::run(self, area_id, *report).await
+            }
             Commands::Sources { command } => commands::sources::run(self, command).await,
             Commands::Config { command } => commands::config::run(self, command).await,
             Commands::Profile { command } => commands::profile::run(self, command).await,

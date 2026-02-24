@@ -1,3 +1,4 @@
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -8,6 +9,74 @@ use tokio::time::sleep;
 use super::discovery::{discover_browser, BrowserInfo};
 use crate::config::ProfileConfig;
 use crate::error::{ActionbookError, Result};
+
+/// Clean up stale Chrome lock files that prevent new instances from starting.
+/// This handles the case where Chrome was killed or crashed, leaving behind
+/// SingletonLock/Socket/Cookie files.
+pub fn clean_chrome_locks(profile_dir: &std::path::Path) {
+    for filename in &["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let path = profile_dir.join(filename);
+        if path.exists() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::debug!("Removed stale lock file: {}", path.display()),
+                Err(e) => tracing::warn!("Failed to remove {}: {}", path.display(), e),
+            }
+        }
+    }
+}
+
+/// Check if the last Chrome session exited uncleanly (crashed).
+pub fn was_unclean_exit(profile_dir: &std::path::Path) -> bool {
+    let prefs_path = profile_dir.join("Default").join("Preferences");
+    if !prefs_path.exists() {
+        return false;
+    }
+
+    match std::fs::read_to_string(&prefs_path) {
+        Ok(content) => content.contains("\"exit_type\":\"Crashed\"")
+            || content.contains("\"exited_cleanly\":false"),
+        Err(_) => false,
+    }
+}
+
+/// Mark Chrome as having exited cleanly by patching the Preferences JSON.
+/// This prevents the "Chrome didn't shut down correctly" restore bar.
+pub fn mark_clean_exit(profile_dir: &std::path::Path) {
+    let prefs_path = profile_dir.join("Default").join("Preferences");
+    if !prefs_path.exists() {
+        return;
+    }
+
+    match std::fs::read_to_string(&prefs_path) {
+        Ok(content) => {
+            let patched = content
+                .replace("\"exit_type\":\"Crashed\"", "\"exit_type\":\"Normal\"")
+                .replace("\"exited_cleanly\":false", "\"exited_cleanly\":true");
+
+            if patched != content {
+                if let Err(e) = std::fs::write(&prefs_path, &patched) {
+                    tracing::warn!("Failed to mark clean exit in Preferences: {}", e);
+                } else {
+                    tracing::debug!("Marked clean exit in {}", prefs_path.display());
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Failed to read Preferences for clean exit: {}", e),
+    }
+}
+
+/// Check if a TCP port is available for binding
+fn is_port_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Find a free TCP port in the ephemeral range
+fn find_free_port() -> Option<u16> {
+    TcpListener::bind(("127.0.0.1", 0))
+        .ok()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|addr| addr.port())
+}
 
 /// Browser launcher that starts a browser with CDP enabled
 pub struct BrowserLauncher {
@@ -146,8 +215,9 @@ impl BrowserLauncher {
             args.extend(super::stealth_enhanced::get_enhanced_stealth_args());
         } else {
             // Basic anti-detection flags
-            args.push("--disable-blink-features=AutomationControlled".to_string());
-            args.push("--disable-infobars".to_string());
+            // NOTE: --disable-blink-features=AutomationControlled removed — it triggers
+            // Chrome's "unsupported command line flag" warning bar. The same protection
+            // is applied via CDP (navigator.webdriver override) in apply_stealth_js().
             args.push("--window-size=1920,1080".to_string());
             args.push("--disable-save-password-bubble".to_string());
             args.push("--disable-translate".to_string());
@@ -284,11 +354,12 @@ impl BrowserLauncher {
 
         let args = self.build_args();
 
-        tracing::debug!(
-            "Launching browser: {:?} with args: {:?}",
+        tracing::info!(
+            "Launching {} at {:?}",
+            self.browser_info.browser_type.name(),
             self.browser_info.path,
-            args
         );
+        tracing::debug!("Browser args: {:?}", args);
 
         let child = Command::new(&self.browser_info.path)
             .args(args)
@@ -306,8 +377,39 @@ impl BrowserLauncher {
         Ok(child)
     }
 
-    /// Launch the browser and wait for CDP to be ready
-    pub async fn launch_and_wait(&self) -> Result<(Child, String)> {
+    /// Launch the browser and wait for CDP to be ready.
+    /// If the configured CDP port is busy, automatically picks a free port.
+    pub async fn launch_and_wait(&mut self) -> Result<(Child, String)> {
+        // G3: Clean stale lock files and handle unclean exits
+        clean_chrome_locks(&self.user_data_dir);
+        if was_unclean_exit(&self.user_data_dir) {
+            tracing::info!("Detected unclean Chrome exit, cleaning up");
+            mark_clean_exit(&self.user_data_dir);
+            // Clear sessions directory to prevent tab restore hang
+            let sessions_dir = self.user_data_dir.join("Default").join("Sessions");
+            if sessions_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&sessions_dir) {
+                    tracing::warn!("Failed to clear Sessions directory: {}", e);
+                }
+            }
+        }
+
+        // Check if configured port is available; if not, find a free one
+        if !is_port_available(self.cdp_port) {
+            let old_port = self.cdp_port;
+            self.cdp_port = find_free_port().ok_or_else(|| {
+                ActionbookError::BrowserLaunchFailed(format!(
+                    "Port {} is occupied and no free port found",
+                    old_port
+                ))
+            })?;
+            tracing::info!(
+                "Port {} is busy, using port {} instead",
+                old_port,
+                self.cdp_port
+            );
+        }
+
         let result = self.launch()?;
 
         // Wait for CDP to be ready
@@ -534,18 +636,21 @@ mod tests {
 
 
     #[test]
-    fn build_args_includes_anti_detection_flags() {
+    fn build_args_excludes_deprecated_flags() {
+        // AutomationControlled and disable-infobars were removed because they
+        // trigger Chrome's "unsupported command line flag" warning bar.
+        // The same protection is applied via CDP injection in apply_stealth_js().
         let dir = PathBuf::from("/tmp/test-profile");
         let launcher = test_launcher_with_user_data_dir(dir);
         let args = launcher.build_args();
 
         assert!(
-            args.iter().any(|a| a.contains("AutomationControlled")),
-            "AutomationControlled flag should be set"
+            !args.iter().any(|a| a.contains("AutomationControlled")),
+            "AutomationControlled flag should NOT be set (causes Chrome warning)"
         );
         assert!(
-            args.contains(&"--disable-infobars".to_string()),
-            "disable-infobars should be set"
+            !args.contains(&"--disable-infobars".to_string()),
+            "disable-infobars should NOT be set (deprecated in Chrome 76+)"
         );
     }
 }
