@@ -31,12 +31,13 @@ pub async fn try_http_fetch(
     max_tokens: Option<usize>,
     _session_tag: Option<&str>,
 ) -> Result<Option<HttpFetchResult>, Box<dyn std::error::Error + Send + Sync>> {
-    // Security: Normalize HTTP URLs to HTTPS to prevent downgrade attacks
-    let normalized_url = if url.starts_with("http://") {
-        url.replacen("http://", "https://", 1)
-    } else {
-        url.to_string()
-    };
+    // Security: Parse URL and force HTTPS scheme to prevent downgrade attacks
+    let mut parsed_url = reqwest::Url::parse(url)?;
+    if parsed_url.scheme() == "http" {
+        parsed_url
+            .set_scheme("https")
+            .map_err(|_| "Failed to set HTTPS scheme")?;
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -44,7 +45,7 @@ pub async fn try_http_fetch(
         .user_agent("Mozilla/5.0 (compatible; Actionbook/1.0)")
         .build()?;
 
-    let resp = match client.get(&normalized_url).send().await {
+    let resp = match client.get(parsed_url.clone()).send().await {
         Ok(r) => r,
         Err(_) => return Ok(None), // Network error → fallback to browser
     };
