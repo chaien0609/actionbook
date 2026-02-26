@@ -217,7 +217,7 @@ impl SessionManager {
     ) -> Result<(Browser, Handler)> {
         let stealth_enabled = self.is_stealth_enabled();
 
-        let launcher =
+        let mut launcher =
             BrowserLauncher::from_profile(profile_name, profile)?.with_stealth(stealth_enabled);
 
         let (_child, cdp_url) = launcher.launch_and_wait().await?;
@@ -489,8 +489,8 @@ impl SessionManager {
         Err(ActionbookError::Other("No response received".to_string()))
     }
 
-    /// Helper to send a CDP command and get response
-    async fn send_cdp_command(
+    /// Helper to send a CDP command and get response (public for snapshot/blocking)
+    pub async fn send_cdp_command(
         &self,
         profile_name: Option<&str>,
         method: &str,
@@ -634,6 +634,32 @@ impl SessionManager {
             if (selector.startsWith('//') || selector.startsWith('(//')) {
                 const result = document.evaluate(selector, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
                 return result.singleNodeValue;
+            }
+            // Extended selector support: :has-text("...") and :nth(N)
+            // These are Playwright-style pseudo-selectors not in native CSS
+            const hasTextRe = /:has-text\(['"](.+?)['"]\)/;
+            const nthRe = /:nth\((\d+)\)$/;
+            const hasTextM = selector.match(hasTextRe);
+            const nthM = selector.match(nthRe);
+            if (hasTextM || nthM) {
+                let base = selector;
+                let textFilter = null;
+                let nthIdx = null;
+                if (hasTextM) {
+                    textFilter = hasTextM[1];
+                    base = base.replace(hasTextRe, '');
+                }
+                if (nthM) {
+                    nthIdx = parseInt(nthM[1]);
+                    base = base.replace(nthRe, '');
+                }
+                base = base.trim() || '*';
+                let els = Array.from(document.querySelectorAll(base));
+                if (textFilter) {
+                    els = els.filter(el => el.textContent && el.textContent.includes(textFilter));
+                }
+                if (nthIdx !== null) return els[nthIdx] || null;
+                return els[0] || null;
             }
             return document.querySelector(selector);
         }
@@ -1198,6 +1224,31 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Dispatch a single character key event (for human-like typing)
+    pub async fn dispatch_key_char(&self, profile_name: Option<&str>, ch: char) -> Result<()> {
+        let text = ch.to_string();
+        self.send_cdp_command(
+            profile_name,
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": "keyDown",
+                "key": &text,
+                "text": &text,
+            }),
+        )
+        .await?;
+        self.send_cdp_command(
+            profile_name,
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": "keyUp",
+                "key": &text,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Get page HTML
     pub async fn get_html(
         &self,
@@ -1490,6 +1541,979 @@ impl SessionManager {
             }
         }
     }
+
+    // ========== G5: Fingerprint Rotation ==========
+
+    /// Generate and apply a new browser fingerprint dynamically.
+    /// Updates UA, platform, screen dimensions, hardware concurrency, and device memory.
+    pub async fn rotate_fingerprint(
+        &self,
+        profile_name: Option<&str>,
+        fingerprint: &super::stealth_enhanced::EnhancedStealthProfile,
+    ) -> Result<()> {
+        // 1. Set User-Agent override via Emulation
+        self.send_cdp_command(
+            profile_name,
+            "Emulation.setUserAgentOverride",
+            serde_json::json!({
+                "userAgent": fingerprint.user_agent,
+                "platform": fingerprint.platform,
+                "acceptLanguage": fingerprint.language,
+            }),
+        )
+        .await?;
+
+        // 2. Inject screen/hardware overrides via JS
+        let screen_js = format!(
+            r#"(function() {{
+                Object.defineProperty(screen, 'width', {{ get: () => {} }});
+                Object.defineProperty(screen, 'height', {{ get: () => {} }});
+                Object.defineProperty(screen, 'availWidth', {{ get: () => {} }});
+                Object.defineProperty(screen, 'availHeight', {{ get: () => {} }});
+                Object.defineProperty(screen, 'colorDepth', {{ get: () => {} }});
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {} }});
+                Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {} }});
+            }})()"#,
+            fingerprint.screen_width,
+            fingerprint.screen_height,
+            fingerprint.avail_width,
+            fingerprint.avail_height,
+            fingerprint.color_depth,
+            fingerprint.hardware_concurrency,
+            fingerprint.device_memory,
+        );
+
+        self.eval_on_page(profile_name, &screen_js).await?;
+
+        // 3. Register for future pages too
+        self.send_cdp_command(
+            profile_name,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": &screen_js }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== G2: Global Animation Disabling ==========
+
+    /// Disable all CSS animations and transitions on the current and future pages.
+    /// Injects CSS via `Page.addScriptToEvaluateOnNewDocument` and applies
+    /// `Emulation.setEmulatedMedia` with `prefers-reduced-motion: reduce`.
+    pub async fn disable_animations(&self, profile_name: Option<&str>) -> Result<()> {
+        let css = r#"*, *::before, *::after { animation: none !important; animation-duration: 0s !important; transition: none !important; transition-duration: 0s !important; scroll-behavior: auto !important; }"#;
+
+        let inject_js = format!(
+            r#"(function() {{ var s = document.createElement('style'); s.textContent = {}; document.head.appendChild(s); }})()"#,
+            serde_json::to_string(css).unwrap_or_default()
+        );
+
+        // 1. Inject CSS on current page immediately
+        self.eval_on_page(profile_name, &inject_js).await?;
+
+        // 2. Register script for all future page loads
+        self.send_cdp_command(
+            profile_name,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": &inject_js }),
+        )
+        .await?;
+
+        // 3. Set prefers-reduced-motion media feature
+        self.send_cdp_command(
+            profile_name,
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({
+                "features": [
+                    { "name": "prefers-reduced-motion", "value": "reduce" }
+                ]
+            }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== F3: Resource Blocking ==========
+
+    /// Block resource loading by URL patterns via CDP Network.setBlockedURLs
+    pub async fn set_resource_blocking(
+        &self,
+        profile_name: Option<&str>,
+        level: ResourceBlockLevel,
+    ) -> Result<()> {
+        let patterns = level.patterns();
+        if patterns.is_empty() {
+            return Ok(());
+        }
+
+        // Enable Network domain first
+        self.send_cdp_command(profile_name, "Network.enable", serde_json::json!({}))
+            .await?;
+
+        self.send_cdp_command(
+            profile_name,
+            "Network.setBlockedURLs",
+            serde_json::json!({ "urls": patterns }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== F4: Readability Text Extraction ==========
+
+    /// Get readable text content from the page using readability extraction
+    pub async fn get_readable_text(
+        &self,
+        profile_name: Option<&str>,
+        mode: TextExtractionMode,
+    ) -> Result<String> {
+        let js = match mode {
+            TextExtractionMode::Raw => "document.body.innerText".to_string(),
+            TextExtractionMode::Readability => {
+                super::readability::READABILITY_JS.to_string()
+            }
+        };
+
+        let result = self.eval_on_page(profile_name, &js).await?;
+        Ok(result.as_str().unwrap_or("").to_string())
+    }
+
+    // ========== F1: CDP Accessibility Tree ==========
+
+    /// Get the full accessibility tree via CDP Accessibility.getFullAXTree
+    pub async fn get_accessibility_tree(
+        &self,
+        profile_name: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.send_cdp_command(
+            profile_name,
+            "Accessibility.getFullAXTree",
+            serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Get the backendNodeId of an element matching a CSS selector
+    pub async fn get_backend_node_id(
+        &self,
+        profile_name: Option<&str>,
+        selector: &str,
+    ) -> Result<Option<i64>> {
+        // Get document root
+        let doc = self
+            .send_cdp_command(profile_name, "DOM.getDocument", serde_json::json!({}))
+            .await?;
+        let root_id = doc
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(|n| n.as_i64())
+            .unwrap_or(1);
+
+        // Query selector
+        let result = self
+            .send_cdp_command(
+                profile_name,
+                "DOM.querySelector",
+                serde_json::json!({ "nodeId": root_id, "selector": selector }),
+            )
+            .await?;
+        let node_id = result.get("nodeId").and_then(|n| n.as_i64()).unwrap_or(0);
+        if node_id == 0 {
+            return Ok(None);
+        }
+
+        // Describe node to get backendNodeId
+        let desc = self
+            .send_cdp_command(
+                profile_name,
+                "DOM.describeNode",
+                serde_json::json!({ "nodeId": node_id }),
+            )
+            .await?;
+        let backend_id = desc
+            .get("node")
+            .and_then(|n| n.get("backendNodeId"))
+            .and_then(|b| b.as_i64());
+
+        Ok(backend_id)
+    }
+
+    // ========== F2: Node-based actions ==========
+
+    /// Resolve a backendNodeId to a JS remote object, then call a function on it
+    pub async fn resolve_and_call(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+        function_declaration: &str,
+    ) -> Result<serde_json::Value> {
+        use futures::SinkExt;
+        use futures::stream::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let page_info = self.get_active_page_info(profile_name).await?;
+        let ws_url = page_info
+            .web_socket_debugger_url
+            .ok_or_else(|| ActionbookError::CdpConnectionFailed("No WebSocket URL".to_string()))?;
+
+        let (mut ws, _) = connect_async(&ws_url).await.map_err(|e| {
+            ActionbookError::CdpConnectionFailed(format!("WebSocket connection failed: {}", e))
+        })?;
+
+        // Helper to send a command and wait for its response on the same connection
+        async fn send_and_recv(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            id: u64,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            use futures::SinkExt;
+            use futures::stream::StreamExt;
+
+            let cmd = serde_json::json!({ "id": id, "method": method, "params": params });
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(cmd.to_string().into()))
+                .await
+                .map_err(|e| ActionbookError::Other(format!("Failed to send {}: {}", method, e)))?;
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        let response: serde_json::Value = serde_json::from_str(text.as_str())?;
+                        if response.get("id") == Some(&serde_json::json!(id)) {
+                            if let Some(error) = response.get("error") {
+                                return Err(ActionbookError::Other(format!("CDP error: {}", error)));
+                            }
+                            return Ok(response
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null));
+                        }
+                        // Not our response, skip (could be events)
+                    }
+                    Ok(_) => continue,
+                    Err(e) => return Err(ActionbookError::Other(format!("WebSocket error: {}", e))),
+                }
+            }
+            Err(ActionbookError::Other(format!("No response for {}", method)))
+        }
+
+        // All commands on the same WebSocket connection:
+        // 1. Enable DOM domain
+        let _ = send_and_recv(&mut ws, 1, "DOM.enable", serde_json::json!({})).await;
+        // 2. Get document root (populates internal DOM state)
+        let _ = send_and_recv(&mut ws, 2, "DOM.getDocument", serde_json::json!({})).await;
+        // 3. Resolve backendNodeId to remote object
+        let resolved = send_and_recv(
+            &mut ws, 3, "DOM.resolveNode",
+            serde_json::json!({ "backendNodeId": backend_node_id }),
+        ).await?;
+
+        let object_id = resolved
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| {
+                ActionbookError::ElementNotFound(format!(
+                    "Could not resolve backendNodeId {}",
+                    backend_node_id
+                ))
+            })?;
+
+        // 4. Call function on the resolved object
+        let result = send_and_recv(
+            &mut ws, 4, "Runtime.callFunctionOn",
+            serde_json::json!({
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "returnByValue": true,
+            }),
+        ).await?;
+
+        Ok(result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Get the center coordinates of an element by backendNodeId (scrolls into view)
+    pub async fn get_element_center_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+    ) -> Result<(f64, f64)> {
+        let coords = self
+            .resolve_and_call(
+                profile_name,
+                backend_node_id,
+                "function() { this.scrollIntoView({ behavior: 'instant', block: 'center' }); \
+                 const r = this.getBoundingClientRect(); \
+                 return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }",
+            )
+            .await?;
+        let x = coords.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = coords.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        Ok((x, y))
+    }
+
+    /// Get the center coordinates of an element by CSS selector (scrolls into view)
+    pub async fn get_element_center(
+        &self,
+        profile_name: Option<&str>,
+        selector: &str,
+    ) -> Result<(f64, f64)> {
+        let js = format!(
+            r#"(function() {{
+                var el = document.querySelector({sel});
+                if (!el) return null;
+                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                var r = el.getBoundingClientRect();
+                return {{ x: r.left + r.width / 2, y: r.top + r.height / 2 }};
+            }})()"#,
+            sel = serde_json::to_string(selector).unwrap_or_else(|_| format!("\"{}\"", selector))
+        );
+        let result = self.eval_on_page(profile_name, &js).await?;
+        let x = result.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = result.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        Ok((x, y))
+    }
+
+    /// Click an element by backendNodeId
+    pub async fn click_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+    ) -> Result<()> {
+        // Scroll into view and get coordinates
+        let (x, y) = self.get_element_center_by_node_id(profile_name, backend_node_id).await?;
+
+        // Dispatch click events
+        for event_type in &["mouseMoved", "mousePressed", "mouseReleased"] {
+            let mut params = serde_json::json!({ "type": event_type, "x": x, "y": y });
+            if *event_type != "mouseMoved" {
+                params["button"] = serde_json::json!("left");
+                params["clickCount"] = serde_json::json!(1);
+            }
+            self.send_cdp_command(profile_name, "Input.dispatchMouseEvent", params)
+                .await?;
+        }
+        Ok(())
+    }
+
+    // ========== File Upload via DOM.setFileInputFiles ==========
+
+    /// Set files on a file input element located by CSS selector.
+    ///
+    /// Uses a single WebSocket connection to:
+    /// 1. DOM.enable + DOM.getDocument
+    /// 2. DOM.querySelector to find the element
+    /// 3. DOM.setFileInputFiles to set the file paths
+    /// 4. Dispatch change + input events via Runtime.callFunctionOn
+    pub async fn set_file_input_files(
+        &self,
+        profile_name: Option<&str>,
+        selector: &str,
+        files: &[String],
+    ) -> Result<()> {
+        use tokio_tungstenite::connect_async;
+
+        let page_info = self.get_active_page_info(profile_name).await?;
+        let ws_url = page_info
+            .web_socket_debugger_url
+            .ok_or_else(|| ActionbookError::CdpConnectionFailed("No WebSocket URL".to_string()))?;
+
+        let (mut ws, _) = connect_async(&ws_url).await.map_err(|e| {
+            ActionbookError::CdpConnectionFailed(format!("WebSocket connection failed: {}", e))
+        })?;
+
+        // Reuse the same send_and_recv helper pattern from resolve_and_call
+        async fn send_and_recv(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            id: u64,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            use futures::SinkExt;
+            use futures::stream::StreamExt;
+
+            let cmd = serde_json::json!({ "id": id, "method": method, "params": params });
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(cmd.to_string().into()))
+                .await
+                .map_err(|e| ActionbookError::Other(format!("Failed to send {}: {}", method, e)))?;
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        let response: serde_json::Value = serde_json::from_str(text.as_str())?;
+                        if response.get("id") == Some(&serde_json::json!(id)) {
+                            if let Some(error) = response.get("error") {
+                                return Err(ActionbookError::Other(format!("CDP error: {}", error)));
+                            }
+                            return Ok(response
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null));
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(e) => return Err(ActionbookError::Other(format!("WebSocket error: {}", e))),
+                }
+            }
+            Err(ActionbookError::Other(format!("No response for {}", method)))
+        }
+
+        // 1. Enable DOM
+        let _ = send_and_recv(&mut ws, 1, "DOM.enable", serde_json::json!({})).await;
+
+        // 2. Get document root
+        let doc = send_and_recv(&mut ws, 2, "DOM.getDocument", serde_json::json!({})).await?;
+        let root_id = doc
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(|n| n.as_i64())
+            .unwrap_or(1);
+
+        // 3. querySelector to find the file input
+        let qs_result = send_and_recv(
+            &mut ws,
+            3,
+            "DOM.querySelector",
+            serde_json::json!({ "nodeId": root_id, "selector": selector }),
+        )
+        .await?;
+        let node_id = qs_result.get("nodeId").and_then(|n| n.as_i64()).unwrap_or(0);
+        if node_id == 0 {
+            return Err(ActionbookError::ElementNotFound(format!(
+                "File input not found: {}",
+                selector
+            )));
+        }
+
+        // 4. DOM.setFileInputFiles
+        let _ = send_and_recv(
+            &mut ws,
+            4,
+            "DOM.setFileInputFiles",
+            serde_json::json!({ "files": files, "nodeId": node_id }),
+        )
+        .await?;
+
+        // 5. Resolve node to object for event dispatch
+        let resolved = send_and_recv(
+            &mut ws,
+            5,
+            "DOM.resolveNode",
+            serde_json::json!({ "nodeId": node_id }),
+        )
+        .await?;
+
+        let object_id = resolved
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|id| id.as_str());
+
+        // 6. Dispatch change + input events (best-effort)
+        if let Some(oid) = object_id {
+            let _ = send_and_recv(
+                &mut ws,
+                6,
+                "Runtime.callFunctionOn",
+                serde_json::json!({
+                    "objectId": oid,
+                    "functionDeclaration": "function() { this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }",
+                    "returnByValue": true,
+                }),
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Set files on a file input element located by backendNodeId.
+    ///
+    /// Uses DOM.setFileInputFiles with backendNodeId, then dispatches events via resolve_and_call.
+    pub async fn set_file_input_files_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+        files: &[String],
+    ) -> Result<()> {
+        // 1. Set files using backendNodeId
+        self.send_cdp_command(
+            profile_name,
+            "DOM.setFileInputFiles",
+            serde_json::json!({ "files": files, "backendNodeId": backend_node_id }),
+        )
+        .await?;
+
+        // 2. Dispatch change + input events via resolve_and_call
+        let _ = self
+            .resolve_and_call(
+                profile_name,
+                backend_node_id,
+                "function() { this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }",
+            )
+            .await;
+
+        Ok(())
+    }
+
+    /// Focus an element by backendNodeId
+    pub async fn focus_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+    ) -> Result<()> {
+        self.send_cdp_command(
+            profile_name,
+            "DOM.focus",
+            serde_json::json!({ "backendNodeId": backend_node_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Type text into an element by backendNodeId (focus + dispatchKeyEvent)
+    pub async fn type_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        self.focus_by_node_id(profile_name, backend_node_id).await?;
+        for ch in text.chars() {
+            self.send_cdp_command(
+                profile_name,
+                "Input.dispatchKeyEvent",
+                serde_json::json!({
+                    "type": "keyDown",
+                    "text": ch.to_string(),
+                }),
+            )
+            .await?;
+            self.send_cdp_command(
+                profile_name,
+                "Input.dispatchKeyEvent",
+                serde_json::json!({ "type": "keyUp" }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Fill (clear + set value) an element by backendNodeId
+    pub async fn fill_by_node_id(
+        &self,
+        profile_name: Option<&str>,
+        backend_node_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        self.focus_by_node_id(profile_name, backend_node_id).await?;
+        let text_json = serde_json::to_string(text)?;
+        self.resolve_and_call(
+            profile_name,
+            backend_node_id,
+            &format!(
+                "function() {{ this.value = {text_json}; \
+                 this.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+                 this.dispatchEvent(new Event('change', {{ bubbles: true }})); }}"
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ========== F5: Human-like input ==========
+
+    // ========== H1: Console Log Capture ==========
+
+    /// Capture console log entries from the page via CDP Runtime.evaluate
+    /// This fetches any existing console entries via performance logs.
+    pub async fn capture_console_logs(
+        &self,
+        profile_name: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let js = r#"(function() {
+            if (!window.__ab_console_logs) return [];
+            return window.__ab_console_logs.splice(0);
+        })()"#;
+
+        let result = self.eval_on_page(profile_name, js).await?;
+        let empty = vec![];
+        let logs = result.as_array().unwrap_or(&empty);
+        Ok(logs.clone())
+    }
+
+    /// Install console log interceptor on the current page
+    pub async fn install_console_interceptor(&self, profile_name: Option<&str>) -> Result<()> {
+        let js = r#"(function() {
+            if (window.__ab_console_installed) return;
+            window.__ab_console_installed = true;
+            window.__ab_console_logs = [];
+            const MAX = 200;
+            ['log','warn','error','info','debug'].forEach(function(level) {
+                var orig = console[level];
+                console[level] = function() {
+                    var args = Array.from(arguments).map(function(a) {
+                        try { return typeof a === 'object' ? JSON.stringify(a) : String(a); }
+                        catch(e) { return String(a); }
+                    });
+                    window.__ab_console_logs.push({
+                        level: level,
+                        text: args.join(' '),
+                        timestamp: Date.now()
+                    });
+                    if (window.__ab_console_logs.length > MAX) {
+                        window.__ab_console_logs = window.__ab_console_logs.slice(-MAX);
+                    }
+                    orig.apply(console, arguments);
+                };
+            });
+        })()"#;
+
+        self.eval_on_page(profile_name, js).await?;
+
+        // Also register for future pages
+        self.send_cdp_command(
+            profile_name,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": js }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== H2: Network Idle Wait ==========
+
+    /// Wait for network to become idle (no pending requests for `idle_ms` milliseconds)
+    pub async fn wait_for_network_idle(
+        &self,
+        profile_name: Option<&str>,
+        timeout_ms: u64,
+        idle_ms: u64,
+    ) -> Result<()> {
+        // Install a network request counter via JS
+        let setup_js = r#"(function() {
+            if (window.__ab_net_installed) return;
+            window.__ab_net_installed = true;
+            window.__ab_pending_requests = 0;
+            window.__ab_last_activity = Date.now();
+            var origFetch = window.fetch;
+            window.fetch = function() {
+                window.__ab_pending_requests++;
+                window.__ab_last_activity = Date.now();
+                return origFetch.apply(this, arguments).finally(function() {
+                    window.__ab_pending_requests--;
+                    window.__ab_last_activity = Date.now();
+                });
+            };
+            var origOpen = XMLHttpRequest.prototype.open;
+            var origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function() {
+                this.__ab_tracked = true;
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                if (this.__ab_tracked) {
+                    window.__ab_pending_requests++;
+                    window.__ab_last_activity = Date.now();
+                    this.addEventListener('loadend', function() {
+                        window.__ab_pending_requests--;
+                        window.__ab_last_activity = Date.now();
+                    });
+                }
+                return origSend.apply(this, arguments);
+            };
+        })()"#;
+
+        self.eval_on_page(profile_name, setup_js).await?;
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            let status_js = "(function() { return { pending: window.__ab_pending_requests || 0, lastActivity: window.__ab_last_activity || 0 }; })()";
+            let status = self.eval_on_page(profile_name, status_js).await?;
+            let pending = status.get("pending").and_then(|v| v.as_i64()).unwrap_or(0);
+            let last_activity = status.get("lastActivity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            if pending == 0 {
+                // Check JS-side idle time
+                let now_js = self.eval_on_page(profile_name, "Date.now()").await?;
+                let now = now_js.as_f64().unwrap_or(0.0);
+                let idle_since = now - last_activity;
+                if idle_since >= idle_ms as f64 {
+                    return Ok(());
+                }
+            }
+
+            if start.elapsed() > timeout {
+                return Err(ActionbookError::Timeout(format!(
+                    "Network not idle within {}ms ({} requests pending)",
+                    timeout_ms, pending
+                )));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // ========== H3: Dialog Auto-Handling ==========
+
+    /// Enable auto-dismissal of JavaScript dialogs (alert, confirm, prompt)
+    pub async fn enable_dialog_auto_dismiss(&self, profile_name: Option<&str>) -> Result<()> {
+        // Enable Page domain events
+        self.send_cdp_command(profile_name, "Page.enable", serde_json::json!({}))
+            .await?;
+
+        // Use Runtime.evaluate to set up a handler that auto-accepts dialogs
+        // We also need to use Page.handleJavaScriptDialog via CDP event listener,
+        // but since we're using one-shot WS connections, we inject JS-level override instead
+        let js = r#"(function() {
+            if (window.__ab_dialog_installed) return;
+            window.__ab_dialog_installed = true;
+            window.__ab_dialog_log = [];
+            window.alert = function(msg) {
+                window.__ab_dialog_log.push({type:'alert', message:String(msg), timestamp:Date.now()});
+            };
+            var origConfirm = window.confirm;
+            window.confirm = function(msg) {
+                window.__ab_dialog_log.push({type:'confirm', message:String(msg), timestamp:Date.now()});
+                return true;
+            };
+            var origPrompt = window.prompt;
+            window.prompt = function(msg, def) {
+                window.__ab_dialog_log.push({type:'prompt', message:String(msg), timestamp:Date.now()});
+                return def || '';
+            };
+            window.onbeforeunload = null;
+        })()"#;
+
+        self.eval_on_page(profile_name, js).await?;
+
+        // Register for future pages
+        self.send_cdp_command(
+            profile_name,
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({ "source": js }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // ========== H4: Element Info ==========
+
+    /// Get detailed information about an element by CSS selector
+    pub async fn get_element_info(
+        &self,
+        profile_name: Option<&str>,
+        selector: &str,
+    ) -> Result<serde_json::Value> {
+        let selector_json = serde_json::to_string(selector)?;
+        let js = [
+            "(function() {",
+            Self::find_element_js(),
+            &format!("const el = __findElement({selector_json});"),
+            r#"if (!el) return null;
+            const rect = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            const attrs = {};
+            for (const a of el.attributes) { attrs[a.name] = a.value; }
+            const selectors = [];
+            if (el.id) selectors.push('#' + el.id);
+            if (el.getAttribute('data-testid')) selectors.push('[data-testid="' + el.getAttribute('data-testid') + '"]');
+            if (el.getAttribute('aria-label')) selectors.push('[aria-label="' + el.getAttribute('aria-label') + '"]');
+            if (el.className && typeof el.className === 'string') {
+                const cls = el.className.trim().split(/\s+/).filter(Boolean);
+                if (cls.length) selectors.push(el.tagName.toLowerCase() + '.' + cls.join('.'));
+            }
+            return {
+                tagName: el.tagName.toLowerCase(),
+                id: el.id || null,
+                className: el.className || null,
+                textContent: (el.textContent || '').trim().substring(0, 200),
+                value: el.value !== undefined ? el.value : null,
+                attributes: attrs,
+                boundingBox: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                computedStyle: {
+                    display: cs.display,
+                    visibility: cs.visibility,
+                    position: cs.position,
+                    color: cs.color,
+                    backgroundColor: cs.backgroundColor,
+                    fontSize: cs.fontSize,
+                    cursor: cs.cursor,
+                    opacity: cs.opacity
+                },
+                isVisible: rect.width > 0 && rect.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none',
+                isInteractive: ['a','button','input','select','textarea'].includes(el.tagName.toLowerCase()) || el.getAttribute('role') === 'button' || cs.cursor === 'pointer',
+                suggestedSelectors: selectors
+            };"#,
+            "})()",
+        ]
+        .join("\n");
+
+        let result = self.eval_on_page(profile_name, &js).await?;
+        if result.is_null() {
+            return Err(ActionbookError::ElementNotFound(selector.to_string()));
+        }
+        Ok(result)
+    }
+
+    // ========== H6: Device Emulation ==========
+
+    /// Emulate a device by setting viewport, UA, and device scale factor
+    pub async fn emulate_device(
+        &self,
+        profile_name: Option<&str>,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+        mobile: bool,
+        user_agent: Option<&str>,
+    ) -> Result<()> {
+        self.send_cdp_command(
+            profile_name,
+            "Emulation.setDeviceMetricsOverride",
+            serde_json::json!({
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": device_scale_factor,
+                "mobile": mobile,
+            }),
+        )
+        .await?;
+
+        if let Some(ua) = user_agent {
+            self.send_cdp_command(
+                profile_name,
+                "Emulation.setUserAgentOverride",
+                serde_json::json!({ "userAgent": ua }),
+            )
+            .await?;
+        }
+
+        // Touch events for mobile
+        if mobile {
+            self.send_cdp_command(
+                profile_name,
+                "Emulation.setTouchEmulationEnabled",
+                serde_json::json!({ "enabled": true }),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    // ========== H7: Wait for JS Condition ==========
+
+    /// Wait for a JavaScript expression to return a truthy value
+    pub async fn wait_for_function(
+        &self,
+        profile_name: Option<&str>,
+        expression: &str,
+        timeout_ms: u64,
+        interval_ms: u64,
+    ) -> Result<serde_json::Value> {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            let result = self.eval_on_page(profile_name, expression).await?;
+
+            // Check for truthy value
+            let is_truthy = match &result {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+                serde_json::Value::String(s) => !s.is_empty(),
+                serde_json::Value::Null => false,
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Object(_) => true,
+            };
+
+            if is_truthy {
+                return Ok(result);
+            }
+
+            if start.elapsed() > timeout {
+                return Err(ActionbookError::Timeout(format!(
+                    "Expression did not become truthy within {}ms: {}",
+                    timeout_ms, expression
+                )));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        }
+    }
+
+    /// Dispatch a sequence of mouse move events following a bezier curve
+    pub async fn dispatch_mouse_moves(
+        &self,
+        profile_name: Option<&str>,
+        points: &[(f64, f64)],
+    ) -> Result<()> {
+        for (x, y) in points {
+            self.send_cdp_command(
+                profile_name,
+                "Input.dispatchMouseEvent",
+                serde_json::json!({ "type": "mouseMoved", "x": x, "y": y }),
+            )
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        }
+        Ok(())
+    }
+}
+
+/// Resource blocking level
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceBlockLevel {
+    None,
+    Images,
+    Media,
+}
+
+impl ResourceBlockLevel {
+    fn patterns(&self) -> Vec<&'static str> {
+        match self {
+            Self::None => vec![],
+            Self::Images => vec![
+                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
+                "*.ico", "*.bmp", "*.avif", "*.jfif", "*.tiff",
+                "*imagedelivery.net*", "*images.unsplash.com*",
+            ],
+            Self::Media => vec![
+                // Images
+                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg",
+                "*.ico", "*.bmp", "*.avif", "*.jfif", "*.tiff",
+                "*imagedelivery.net*", "*images.unsplash.com*",
+                // Fonts
+                "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+                // Video/Audio
+                "*.mp4", "*.webm", "*.ogg", "*.mp3", "*.wav", "*.m3u8",
+                // CSS
+                "*.css",
+            ],
+        }
+    }
+}
+
+/// Text extraction mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextExtractionMode {
+    Raw,
+    Readability,
 }
 
 #[cfg(test)]

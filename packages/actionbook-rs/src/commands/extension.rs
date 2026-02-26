@@ -74,8 +74,15 @@ async fn serve(_cli: &Cli, port: u16) -> Result<()> {
             ))
         })?;
 
+    // Generate session token
+    let token = extension_bridge::generate_token();
+    extension_bridge::write_token_file(&token).await?;
+
+    println!("  {}  Session token: {}", "◆".cyan(), token);
+    println!();
+
     // Run the bridge server
-    let result = extension_bridge::serve(port).await;
+    let result = extension_bridge::serve(port, token).await;
 
     // Cleanup PID file on exit
     extension_bridge::delete_pid_file().await;

@@ -438,8 +438,9 @@ pub async fn apply_enhanced_stealth(
 /// Get Chrome launch args with enhanced stealth flags (Camoufox-inspired)
 pub fn get_enhanced_stealth_args() -> Vec<String> {
     vec![
-        // ========== Critical Anti-Detection Flags ==========
-        "--disable-blink-features=AutomationControlled".to_string(), // CRITICAL!
+        // NOTE: --disable-blink-features=AutomationControlled removed — triggers Chrome's
+        // "unsupported command line flag" warning bar. The webdriver flag is hidden via
+        // CDP injection (Page.addScriptToEvaluateOnNewDocument) in apply_stealth_js().
 
         // ========== WebRTC Protection ==========
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
@@ -449,7 +450,7 @@ pub fn get_enhanced_stealth_args() -> Vec<String> {
         "--disable-setuid-sandbox".to_string(),
 
         // ========== Remove Automation UI ==========
-        "--disable-infobars".to_string(),
+        // NOTE: --disable-infobars removed (deprecated since Chrome 76+, no longer works)
         "--disable-save-password-bubble".to_string(),
         "--disable-translate".to_string(),
 
@@ -495,7 +496,8 @@ mod tests {
     #[test]
     fn test_enhanced_stealth_args() {
         let args = get_enhanced_stealth_args();
-        assert!(args.contains(&"--disable-blink-features=AutomationControlled".to_string()));
+        // AutomationControlled removed — triggers Chrome warning, handled via CDP instead
+        assert!(!args.contains(&"--disable-blink-features=AutomationControlled".to_string()));
         assert!(args
             .contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()));
     }

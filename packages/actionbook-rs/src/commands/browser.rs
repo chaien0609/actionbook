@@ -10,110 +10,44 @@ use tokio::time::timeout;
 #[cfg(feature = "stealth")]
 use crate::browser::apply_stealth_to_page;
 use crate::browser::{
-    bridge_lifecycle, build_stealth_profile, discover_all_browsers, extension_bridge,
-    extension_installer, stealth_status, BrowserDriver, SessionManager, SessionStatus,
-    StealthConfig,
+    build_stealth_profile, discover_all_browsers, extension_bridge, BrowserDriver,
+    stealth_status, SessionManager, SessionStatus, StealthConfig,
+    ResourceBlockLevel,
 };
-use crate::cli::{BrowserCommands, BrowserMode, Cli, CookiesCommands};
+use crate::cli::{BrowserCommands, Cli, CookiesCommands, FingerprintCommands, StorageCommands};
 use crate::config::Config;
 use crate::error::{ActionbookError, Result};
 
-/// Max retries waiting for Chrome extension to connect to the bridge.
-const EXTENSION_CONNECT_RETRIES: u32 = 60;
-/// Interval between retries (60 * 500ms = 30s total).
-const EXTENSION_CONNECT_INTERVAL: Duration = Duration::from_millis(500);
-/// Keep first 6s silent to cover extension polling+handshake.
-const EXTENSION_CONNECT_SILENT_RETRIES: u32 = 12;
-
-/// Send a command once via bridge and apply auto-attach fallback.
-async fn extension_send_once(
-    port: u16,
+/// Send a command (CDP or Extension.*) through the extension bridge.
+/// For CDP methods, auto-attaches the active tab if no tab is currently attached.
+async fn extension_send(
+    cli: &Cli,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let result = extension_bridge::send_command(port, method, params.clone()).await;
+    let result = extension_bridge::send_command(cli.extension_port, method, params.clone()).await;
 
     // Auto-attach: if a CDP method fails because no tab is attached, attach the active tab and retry
     if let Err(ActionbookError::ExtensionError(ref msg)) = result {
         if msg.contains("No tab attached") && !method.starts_with("Extension.") {
             tracing::debug!("Auto-attaching active tab for {}", method);
             extension_bridge::send_command(
-                port,
+                cli.extension_port,
                 "Extension.attachActiveTab",
                 serde_json::json!({}),
             )
             .await?;
-            return extension_bridge::send_command(port, method, params).await;
+            return extension_bridge::send_command(cli.extension_port, method, params).await;
         }
     }
 
     result
 }
 
-/// Send a command (CDP or Extension.*) through the extension bridge.
-/// Also waits (up to 30s) for extension connection when bridge is up but extension isn't linked yet.
-async fn extension_send(
-    cli: &Cli,
-    config: &Config,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let port = resolve_extension_port(cli, config);
-    let result = extension_send_once(port, method, params.clone()).await;
-
-    match &result {
-        Err(ActionbookError::ExtensionError(msg)) if msg.contains("Extension not connected") => {
-            let mut user_notified = false;
-
-            for attempt in 1..=EXTENSION_CONNECT_RETRIES {
-                tokio::time::sleep(EXTENSION_CONNECT_INTERVAL).await;
-                tracing::debug!(
-                    "Retry {}/{}: waiting for extension connection on port {}",
-                    attempt,
-                    EXTENSION_CONNECT_RETRIES,
-                    port
-                );
-
-                match extension_send_once(port, method, params.clone()).await {
-                    Err(ActionbookError::ExtensionError(ref m))
-                        if m.contains("Extension not connected") =>
-                    {
-                        if attempt > EXTENSION_CONNECT_SILENT_RETRIES && !user_notified {
-                            eprintln!(
-                                "Waiting for Chrome extension to connect to bridge on port {}...",
-                                port
-                            );
-                            eprintln!(
-                                "Open Chrome and ensure the Actionbook extension is enabled."
-                            );
-                            user_notified = true;
-                        }
-                        continue;
-                    }
-                    other => {
-                        if other.is_ok() && user_notified {
-                            eprintln!("  {} Extension connected", "✓".green());
-                        }
-                        return other;
-                    }
-                }
-            }
-
-            Err(ActionbookError::ExtensionError(
-                "Extension did not connect within 30 seconds. \
-                 Ensure Chrome is open with the Actionbook extension enabled."
-                    .to_string(),
-            ))
-        }
-        _ => result,
-    }
-}
-
 /// Evaluate JS via the extension bridge and return the result value
-async fn extension_eval(cli: &Cli, config: &Config, expression: &str) -> Result<serde_json::Value> {
+async fn extension_eval(cli: &Cli, expression: &str) -> Result<serde_json::Value> {
     let result = extension_send(
         cli,
-        config,
         "Runtime.evaluate",
         serde_json::json!({
             "expression": expression,
@@ -127,11 +61,7 @@ async fn extension_eval(cli: &Cli, config: &Config, expression: &str) -> Result<
     if let Some(exception) = result.get("exceptionDetails") {
         let msg = exception
             .get("text")
-            .or_else(|| {
-                exception
-                    .get("exception")
-                    .and_then(|e| e.get("description"))
-            })
+            .or_else(|| exception.get("exception").and_then(|e| e.get("description")))
             .and_then(|v| v.as_str())
             .unwrap_or("JavaScript exception");
         return Err(ActionbookError::ExtensionError(format!(
@@ -236,17 +166,67 @@ fn create_session_manager(cli: &Cli, config: &Config) -> SessionManager {
     }
 }
 
+/// Create a browser driver — public entry point for other command modules (e.g., batch)
+pub async fn create_browser_driver_public(cli: &Cli, config: &Config) -> Result<BrowserDriver> {
+    create_browser_driver(cli, config).await
+}
+
 /// Create a browser driver for multi-backend support (CDP or Camoufox)
 async fn create_browser_driver(cli: &Cli, config: &Config) -> Result<BrowserDriver> {
     // Determine profile
-    let profile_name =
-        effective_profile_arg(cli, config).unwrap_or(&config.browser.default_profile);
+    let profile_name = effective_profile_arg(cli, config).unwrap_or(&config.browser.default_profile);
     let profile = config
         .profiles
         .get(profile_name)
         .ok_or_else(|| ActionbookError::Other(format!("Profile not found: {}", profile_name)))?;
 
     BrowserDriver::from_config(config, profile, cli).await
+}
+
+/// Apply resource blocking based on CLI flags (--block-images, --block-media)
+async fn apply_resource_blocking(cli: &Cli, driver: &mut BrowserDriver) {
+    let level = if cli.block_media {
+        ResourceBlockLevel::Media
+    } else if cli.block_images {
+        ResourceBlockLevel::Images
+    } else {
+        ResourceBlockLevel::None
+    };
+    if level != ResourceBlockLevel::None {
+        if let Err(e) = driver.set_resource_blocking(level).await {
+            tracing::warn!("Failed to set resource blocking: {}", e);
+        }
+    }
+
+    // G2: Apply animation disabling if requested
+    if cli.no_animations {
+        if let Err(e) = driver.disable_animations().await {
+            tracing::warn!("Failed to disable animations: {}", e);
+        }
+    }
+
+    // H3: Apply dialog auto-dismissal if requested
+    if cli.auto_dismiss_dialogs {
+        if let Err(e) = driver.enable_dialog_auto_dismiss().await {
+            tracing::warn!("Failed to enable dialog auto-dismiss: {}", e);
+        }
+    }
+}
+
+/// Resolve a snapshot ref (e.g., "e0") to a backendNodeId by fetching the accessibility tree
+async fn resolve_snapshot_ref(driver: &mut BrowserDriver, ref_str: &str) -> Result<i64> {
+    let raw = driver.get_accessibility_tree_raw().await?;
+    let (_nodes, cache) = crate::browser::snapshot::parse_ax_tree(
+        &raw,
+        crate::browser::snapshot::SnapshotFilter::All,
+        None,
+        None,
+    );
+    cache
+        .refs
+        .get(ref_str)
+        .copied()
+        .ok_or_else(|| ActionbookError::Other(format!("Ref '{}' not found in current snapshot", ref_str)))
 }
 
 /// Resolve a CDP endpoint string (port number or ws:// URL) into a (port, ws_url) pair.
@@ -507,103 +487,39 @@ fn has_explicit_scheme(input: &str) -> bool {
     false
 }
 
-fn is_extension_mode(cli: &Cli, config: &Config) -> bool {
-    if let Some(mode) = cli.browser_mode {
-        return mode == BrowserMode::Extension;
-    }
-    if cli.extension {
-        return true;
-    }
-    config.browser.mode == BrowserMode::Extension
-}
-
-/// Fixed bridge port used by extension mode.
-/// The extension dials ws://127.0.0.1:19222, so CLI browser commands must match.
-const FIXED_EXTENSION_PORT: u16 = 19222;
-
-/// Resolve the effective extension bridge port.
-fn resolve_extension_port(_cli: &Cli, _config: &Config) -> u16 {
-    FIXED_EXTENSION_PORT
-}
-
-fn should_prepare_extension_runtime(command: &BrowserCommands) -> bool {
-    !matches!(
-        command,
-        BrowserCommands::Status | BrowserCommands::Connect { .. } | BrowserCommands::Close
-    )
-}
-
-async fn ensure_extension_ready(cli: &Cli, config: &Config) -> Result<()> {
-    if extension_installer::is_installed() {
-        return Ok(());
-    }
-
-    if !config.browser.extension.auto_install {
-        return Err(ActionbookError::ExtensionError(
-            "Extension is not installed and auto-install is disabled.\n\
-             Run 'actionbook extension install' manually, or enable auto-install in ~/.actionbook/config.toml:\n\
-             [browser.extension]\n\
-             auto_install = true"
-                .to_string(),
-        ));
-    }
-
-    if !cli.json {
-        println!(
-            "  {} Extension not found. Auto-installing latest release...",
-            "◆".cyan()
-        );
-    }
-
-    let version = extension_installer::download_and_install(false)
-        .await
-        .map_err(|e| {
-            ActionbookError::ExtensionError(format!(
-                "Failed to auto-install extension: {}.\n\
-             Run 'actionbook extension install' manually and try again.",
-                e
-            ))
-        })?;
-
-    let ext_dir = extension_installer::extension_dir()?;
-
-    if !cli.json {
-        println!(
-            "  {} Extension v{} installed at {}",
-            "✓".green(),
-            version,
-            ext_dir.display()
-        );
-    }
-
-    Ok(())
-}
-
 pub async fn run(cli: &Cli, command: &BrowserCommands) -> Result<()> {
-    let config = Config::load()?;
-    let extension_mode = is_extension_mode(cli, &config);
-    let extension_port = resolve_extension_port(cli, &config);
-
     // --profile is not supported in extension mode: extension operates on the live Chrome profile
-    if extension_mode && cli.profile.is_some() {
+    if cli.extension && cli.profile.is_some() {
         return Err(ActionbookError::Other(
             "--profile is not supported in extension mode. Extension operates on your live Chrome profile. \
              Remove --profile to use the default profile, or remove --extension to use isolated mode.".to_string()
         ));
     }
 
+    let mut config = Config::load()?;
+
+    // Apply CLI overrides (--browser-path, --headless) to the active profile
+    if cli.browser_path.is_some() || cli.headless {
+        let profile_name = cli
+            .profile
+            .as_deref()
+            .unwrap_or(&config.browser.default_profile)
+            .to_string();
+        let mut profile = config.get_profile(&profile_name).unwrap_or_default();
+        if let Some(ref path) = cli.browser_path {
+            profile.browser_path = Some(path.clone());
+        }
+        if cli.headless {
+            profile.headless = true;
+        }
+        config.set_profile(&profile_name, profile);
+    }
+
     // When --cdp is set, resolve it to a fresh WebSocket URL and persist it
     // as the active session *before* any command runs. Skip for `connect`
     // which has its own CDP resolution logic.
-    if !extension_mode && !matches!(command, BrowserCommands::Connect { .. }) {
+    if !matches!(command, BrowserCommands::Connect { .. }) {
         ensure_cdp_override(cli, &config).await?;
-    }
-
-    // In extension mode, ensure bridge daemon is running before executing
-    // browser commands that route through the extension.
-    if extension_mode && should_prepare_extension_runtime(command) {
-        ensure_extension_ready(cli, &config).await?;
-        bridge_lifecycle::ensure_bridge_running(extension_port).await?;
     }
 
     match command {
@@ -620,17 +536,28 @@ pub async fn run(cli: &Cli, command: &BrowserCommands) -> Result<()> {
             timeout: t,
         } => wait(cli, &config, selector, *t).await,
         BrowserCommands::WaitNav { timeout: t } => wait_nav(cli, &config, *t).await,
-        BrowserCommands::Click { selector, wait: w } => click(cli, &config, selector, *w).await,
+        BrowserCommands::Click { selector, wait: w, ref_id, human } => {
+            click(cli, &config, selector.as_deref(), *w, ref_id.as_deref(), *human).await
+        }
         BrowserCommands::Type {
             selector,
             text,
             wait: w,
-        } => type_text(cli, &config, selector, text, *w).await,
+            ref_id,
+            human,
+        } => {
+            let text = text.as_deref().unwrap_or("");
+            type_text(cli, &config, selector.as_deref(), text, *w, ref_id.as_deref(), *human).await
+        },
         BrowserCommands::Fill {
             selector,
             text,
             wait: w,
-        } => fill(cli, &config, selector, text, *w).await,
+            ref_id,
+        } => {
+            let text = text.as_deref().unwrap_or("");
+            fill(cli, &config, selector.as_deref(), text, *w, ref_id.as_deref()).await
+        },
         BrowserCommands::Select { selector, value } => select(cli, &config, selector, value).await,
         BrowserCommands::Hover { selector } => hover(cli, &config, selector).await,
         BrowserCommands::Focus { selector } => focus(cli, &config, selector).await,
@@ -641,8 +568,10 @@ pub async fn run(cli: &Cli, command: &BrowserCommands) -> Result<()> {
         BrowserCommands::Pdf { path } => pdf(cli, &config, path).await,
         BrowserCommands::Eval { code } => eval(cli, &config, code).await,
         BrowserCommands::Html { selector } => html(cli, &config, selector.as_deref()).await,
-        BrowserCommands::Text { selector } => text(cli, &config, selector.as_deref()).await,
-        BrowserCommands::Snapshot => snapshot(cli, &config).await,
+        BrowserCommands::Text { selector, mode } => text(cli, &config, selector.as_deref(), mode).await,
+        BrowserCommands::Snapshot { interactive, cursor, compact, format, depth, selector, diff, max_tokens } => {
+            snapshot(cli, &config, *interactive, *cursor, *compact, format, *depth, selector.as_deref(), *diff, *max_tokens).await
+        }
         BrowserCommands::Inspect { x, y, desc } => {
             inspect(cli, &config, *x, *y, desc.as_deref()).await
         }
@@ -650,6 +579,28 @@ pub async fn run(cli: &Cli, command: &BrowserCommands) -> Result<()> {
         BrowserCommands::Cookies { command } => cookies(cli, &config, command).await,
         BrowserCommands::Scroll { direction, smooth } => {
             scroll(cli, &config, direction, *smooth).await
+        }
+        BrowserCommands::Batch { file, delay } => {
+            crate::commands::batch::run(cli, &config, file.as_deref(), *delay).await
+        }
+        BrowserCommands::Fingerprint { command } => fingerprint(cli, &config, command).await,
+        BrowserCommands::Console { duration, level } => {
+            console_log(cli, &config, *duration, level).await
+        }
+        BrowserCommands::WaitIdle { timeout, idle_time } => {
+            wait_idle(cli, &config, *timeout, *idle_time).await
+        }
+        BrowserCommands::Info { selector } => info(cli, &config, selector).await,
+        BrowserCommands::Storage { command } => storage(cli, &config, command).await,
+        BrowserCommands::Emulate { device } => emulate(cli, &config, device).await,
+        BrowserCommands::WaitFn { expression, timeout, interval } => {
+            wait_fn(cli, &config, expression, *timeout, *interval).await
+        }
+        BrowserCommands::Upload { files, selector, ref_id, wait: w } => {
+            upload(cli, &config, files, selector.as_deref(), ref_id.as_deref(), *w).await
+        }
+        BrowserCommands::Fetch { url, format, max_tokens, timeout: t, lite } => {
+            fetch(cli, &config, url, format, *max_tokens, *t, *lite).await
         }
         BrowserCommands::Close => close(cli, &config).await,
         BrowserCommands::Restart => restart(cli, &config).await,
@@ -771,11 +722,19 @@ async fn status(cli: &Cli, config: &Config) -> Result<()> {
 
 async fn open(cli: &Cli, config: &Config, url: &str) -> Result<()> {
     let normalized_url = normalize_navigation_url(url)?;
+    let normalized_url = if cli.rewrite_urls {
+        let (rewritten, was_rewritten) = crate::browser::url_rewrite::maybe_rewrite(&normalized_url);
+        if was_rewritten {
+            tracing::info!("URL rewritten: {} -> {}", normalized_url, rewritten);
+        }
+        rewritten
+    } else {
+        normalized_url
+    };
 
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         let result = extension_send(
             cli,
-            config,
             "Extension.createTab",
             serde_json::json!({ "url": normalized_url }),
         )
@@ -811,13 +770,11 @@ async fn open(cli: &Cli, config: &Config, url: &str) -> Result<()> {
     tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     if let Some(title) =
-        match try_open_on_initial_blank_page(&session_manager, profile_arg, &normalized_url).await {
+        match try_open_on_initial_blank_page(&session_manager, profile_arg, &normalized_url).await
+        {
             Ok(title) => title,
             Err(e) => {
-                tracing::debug!(
-                    "Failed to reuse initial blank tab, opening a new tab: {}",
-                    e
-                );
+                tracing::debug!("Failed to reuse initial blank tab, opening a new tab: {}", e);
                 None
             }
         }
@@ -895,13 +852,21 @@ async fn open(cli: &Cli, config: &Config, url: &str) -> Result<()> {
 
 async fn goto(cli: &Cli, config: &Config, url: &str, _timeout_ms: u64) -> Result<()> {
     let normalized_url = normalize_navigation_url(url)?;
+    let normalized_url = if cli.rewrite_urls {
+        let (rewritten, was_rewritten) = crate::browser::url_rewrite::maybe_rewrite(&normalized_url);
+        if was_rewritten {
+            tracing::info!("URL rewritten: {} -> {}", normalized_url, rewritten);
+        }
+        rewritten
+    } else {
+        normalized_url
+    };
 
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         // Extension + Camoufox mode: use Camoufox backend through bridge
         if cli.camofox {
             extension_send(
                 cli,
-                config,
                 "Camoufox.goto",
                 serde_json::json!({ "url": normalized_url }),
             )
@@ -923,7 +888,6 @@ async fn goto(cli: &Cli, config: &Config, url: &str, _timeout_ms: u64) -> Result
             // Extension + CDP mode (default)
             extension_send(
                 cli,
-                config,
                 "Page.navigate",
                 serde_json::json!({ "url": normalized_url }),
             )
@@ -959,25 +923,16 @@ async fn goto(cli: &Cli, config: &Config, url: &str, _timeout_ms: u64) -> Result
             })
         );
     } else {
-        let backend_label = if driver.is_camofox() {
-            " (camoufox)"
-        } else {
-            ""
-        };
-        println!(
-            "{} Navigated to: {}{}",
-            "✓".green(),
-            normalized_url,
-            backend_label
-        );
+        let backend_label = if driver.is_camofox() { " (camoufox)" } else { "" };
+        println!("{} Navigated to: {}{}", "✓".green(), normalized_url, backend_label);
     }
 
     Ok(())
 }
 
 async fn back(cli: &Cli, config: &Config) -> Result<()> {
-    if is_extension_mode(cli, config) {
-        extension_eval(cli, config, "history.back()").await?;
+    if cli.extension {
+        extension_eval(cli, "history.back()").await?;
 
         if cli.json {
             println!("{}", serde_json::json!({ "success": true }));
@@ -1002,8 +957,8 @@ async fn back(cli: &Cli, config: &Config) -> Result<()> {
 }
 
 async fn forward(cli: &Cli, config: &Config) -> Result<()> {
-    if is_extension_mode(cli, config) {
-        extension_eval(cli, config, "history.forward()").await?;
+    if cli.extension {
+        extension_eval(cli, "history.forward()").await?;
 
         if cli.json {
             println!("{}", serde_json::json!({ "success": true }));
@@ -1028,8 +983,8 @@ async fn forward(cli: &Cli, config: &Config) -> Result<()> {
 }
 
 async fn reload(cli: &Cli, config: &Config) -> Result<()> {
-    if is_extension_mode(cli, config) {
-        extension_send(cli, config, "Page.reload", serde_json::json!({})).await?;
+    if cli.extension {
+        extension_send(cli, "Page.reload", serde_json::json!({})).await?;
 
         if cli.json {
             println!("{}", serde_json::json!({ "success": true }));
@@ -1054,9 +1009,13 @@ async fn reload(cli: &Cli, config: &Config) -> Result<()> {
 }
 
 async fn pages(cli: &Cli, config: &Config) -> Result<()> {
-    if is_extension_mode(cli, config) {
-        let result =
-            extension_send(cli, config, "Extension.listTabs", serde_json::json!({})).await?;
+    if cli.extension {
+        let result = extension_send(
+            cli,
+            "Extension.listTabs",
+            serde_json::json!({}),
+        )
+        .await?;
 
         let tabs = result
             .get("tabs")
@@ -1069,16 +1028,9 @@ async fn pages(cli: &Cli, config: &Config) -> Result<()> {
         } else if tabs.is_empty() {
             println!("{} No tabs found", "!".yellow());
         } else {
-            println!(
-                "{} {} tabs open (extension mode)\n",
-                "✓".green(),
-                tabs.len()
-            );
+            println!("{} {} tabs open (extension mode)\n", "✓".green(), tabs.len());
             for (i, tab) in tabs.iter().enumerate() {
-                let title = tab
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("(no title)");
+                let title = tab.get("title").and_then(|t| t.as_str()).unwrap_or("(no title)");
                 let url = tab.get("url").and_then(|u| u.as_str()).unwrap_or("");
                 let id = tab.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
                 println!(
@@ -1130,23 +1082,18 @@ async fn pages(cli: &Cli, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn switch(cli: &Cli, config: &Config, page_id: &str) -> Result<()> {
-    if is_extension_mode(cli, config) {
+async fn switch(cli: &Cli, _config: &Config, page_id: &str) -> Result<()> {
+    if cli.extension {
         // In extension mode, page_id is expected to be a tab ID (numeric)
-        let tab_id: u64 = page_id
-            .strip_prefix("tab:")
-            .unwrap_or(page_id)
-            .parse()
-            .map_err(|_| {
-                ActionbookError::Other(format!(
-                    "Invalid tab ID: {}. Use the numeric ID from 'pages' command (extension mode)",
-                    page_id
-                ))
-            })?;
+        let tab_id: u64 = page_id.strip_prefix("tab:").unwrap_or(page_id).parse().map_err(|_| {
+            ActionbookError::Other(format!(
+                "Invalid tab ID: {}. Use the numeric ID from 'pages' command (extension mode)",
+                page_id
+            ))
+        })?;
 
         extension_send(
             cli,
-            config,
             "Extension.activateTab",
             serde_json::json!({ "tabId": tab_id }),
         )
@@ -1158,7 +1105,11 @@ async fn switch(cli: &Cli, config: &Config, page_id: &str) -> Result<()> {
                 serde_json::json!({ "success": true, "tabId": tab_id })
             );
         } else {
-            println!("{} Switched to tab {} (extension)", "✓".green(), tab_id);
+            println!(
+                "{} Switched to tab {} (extension)",
+                "✓".green(),
+                tab_id
+            );
         }
         return Ok(());
     }
@@ -1174,7 +1125,7 @@ async fn switch(cli: &Cli, config: &Config, page_id: &str) -> Result<()> {
 }
 
 async fn wait(cli: &Cli, config: &Config, selector: &str, timeout_ms: u64) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         let resolve_js = js_resolve_selector(selector);
         let poll_js = format!(
             r#"(async function() {{
@@ -1188,7 +1139,7 @@ async fn wait(cli: &Cli, config: &Config, selector: &str, timeout_ms: u64) -> Re
             }})()"#,
             timeout_ms, resolve_js
         );
-        let found = extension_eval(cli, config, &poll_js).await?;
+        let found = extension_eval(cli, &poll_js).await?;
         if found.as_bool() != Some(true) {
             return Err(ActionbookError::Timeout(format!(
                 "Element not found within {}ms (extension mode): {}",
@@ -1228,7 +1179,7 @@ async fn wait(cli: &Cli, config: &Config, selector: &str, timeout_ms: u64) -> Re
 }
 
 async fn wait_nav(cli: &Cli, config: &Config, timeout_ms: u64) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         // Poll document.readyState until "complete" or timeout
         let poll_js = format!(
             r#"(async function() {{
@@ -1241,7 +1192,7 @@ async fn wait_nav(cli: &Cli, config: &Config, timeout_ms: u64) -> Result<()> {
             }})()"#,
             timeout_ms
         );
-        let result = extension_eval(cli, config, &poll_js).await?;
+        let result = extension_eval(cli, &poll_js).await?;
         let new_url = result.as_str().unwrap_or("").to_string();
 
         if new_url.is_empty() {
@@ -1252,7 +1203,10 @@ async fn wait_nav(cli: &Cli, config: &Config, timeout_ms: u64) -> Result<()> {
         }
 
         if cli.json {
-            println!("{}", serde_json::json!({ "success": true, "url": new_url }));
+            println!(
+                "{}",
+                serde_json::json!({ "success": true, "url": new_url })
+            );
         } else {
             println!(
                 "{} Navigation complete: {} (extension)",
@@ -1283,13 +1237,56 @@ async fn wait_nav(cli: &Cli, config: &Config, timeout_ms: u64) -> Result<()> {
     Ok(())
 }
 
-async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Result<()> {
-    if is_extension_mode(cli, config) {
+async fn click(
+    cli: &Cli,
+    config: &Config,
+    selector: Option<&str>,
+    wait_ms: u64,
+    ref_id: Option<&str>,
+    human: bool,
+) -> Result<()> {
+    // Require either selector or --ref
+    if selector.is_none() && ref_id.is_none() {
+        return Err(ActionbookError::Other(
+            "Either a CSS selector or --ref must be provided".to_string(),
+        ));
+    }
+
+    // --ref mode: use snapshot ref to click by backendNodeId
+    if let Some(ref_str) = ref_id {
+        let mut driver = create_browser_driver(cli, config).await?;
+        apply_resource_blocking(cli, &mut driver).await;
+        let backend_node_id = resolve_snapshot_ref(&mut driver, ref_str).await?;
+
+        if human {
+            // Human-like click: resolve actual element coords, then bezier path
+            let (target_x, target_y) = driver.get_element_center_by_node_id(backend_node_id).await?;
+            let (start_x, start_y) = crate::browser::human_input::random_start_offset(target_x, target_y);
+            let path = crate::browser::human_input::bezier_mouse_path(start_x, start_y, target_x, target_y);
+            let _ = driver.dispatch_mouse_moves(&path).await;
+            tokio::time::sleep(Duration::from_millis(crate::browser::human_input::pre_click_delay_ms())).await;
+        }
+
+        driver.click_by_node_id(backend_node_id).await?;
+
+        let label = format!("ref={}", ref_str);
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({ "success": true, "ref": ref_str, "backendNodeId": backend_node_id })
+            );
+        } else {
+            println!("{} Clicked: {} (nodeId={})", "✓".green(), label, backend_node_id);
+        }
+        return Ok(());
+    }
+
+    let selector = selector.unwrap();
+
+    if cli.extension {
         if cli.camofox {
-            // Route through Extension Bridge with Camoufox backend
             extension_send(
                 cli,
-                config,
                 "Camoufox.click",
                 serde_json::json!({ "selector": selector }),
             )
@@ -1324,7 +1321,6 @@ async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Resu
         );
 
         if wait_ms > 0 {
-            // Reuse the wait logic
             let poll_js = format!(
                 r#"(async function() {{
                     var deadline = Date.now() + {};
@@ -1337,7 +1333,7 @@ async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Resu
                 }})()"#,
                 wait_ms, resolve_js
             );
-            let found = extension_eval(cli, config, &poll_js).await?;
+            let found = extension_eval(cli, &poll_js).await?;
             if found.as_bool() != Some(true) {
                 return Err(ActionbookError::Timeout(format!(
                     "Element not found within {}ms (extension mode): {}",
@@ -1346,7 +1342,7 @@ async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Resu
             }
         }
 
-        let result = extension_eval(cli, config, &click_js).await?;
+        let result = extension_eval(cli, &click_js).await?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             let err = result
                 .get("error")
@@ -1371,6 +1367,7 @@ async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Resu
 
     // Use BrowserDriver for multi-backend support (CDP or Camoufox)
     let mut driver = create_browser_driver(cli, config).await?;
+    apply_resource_blocking(cli, &mut driver).await;
 
     // Wait is only supported for CDP backend
     if wait_ms > 0 {
@@ -1378,7 +1375,15 @@ async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Resu
             mgr.wait_for_element(effective_profile_arg(cli, config), selector, wait_ms)
                 .await?;
         }
-        // Camoufox: snapshot refresh handles waiting implicitly
+    }
+
+    if human {
+        // Human-like click: resolve actual element coords, then bezier path
+        let (target_x, target_y) = driver.get_element_center(selector).await.unwrap_or((400.0, 300.0));
+        let (start_x, start_y) = crate::browser::human_input::random_start_offset(target_x, target_y);
+        let path = crate::browser::human_input::bezier_mouse_path(start_x, start_y, target_x, target_y);
+        let _ = driver.dispatch_mouse_moves(&path).await;
+        tokio::time::sleep(Duration::from_millis(crate::browser::human_input::pre_click_delay_ms())).await;
     }
 
     driver.click(selector).await?;
@@ -1393,11 +1398,7 @@ async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Resu
             })
         );
     } else {
-        let backend_label = if driver.is_camofox() {
-            " (camoufox)"
-        } else {
-            ""
-        };
+        let backend_label = if driver.is_camofox() { " (camoufox)" } else { "" };
         println!("{} Clicked: {}{}", "✓".green(), selector, backend_label);
     }
 
@@ -1407,16 +1408,65 @@ async fn click(cli: &Cli, config: &Config, selector: &str, wait_ms: u64) -> Resu
 async fn type_text(
     cli: &Cli,
     config: &Config,
-    selector: &str,
+    selector: Option<&str>,
     text: &str,
     wait_ms: u64,
+    ref_id: Option<&str>,
+    human: bool,
 ) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    // Require either selector or --ref
+    if selector.is_none() && ref_id.is_none() {
+        return Err(ActionbookError::Other(
+            "Either a CSS selector or --ref must be provided".to_string(),
+        ));
+    }
+
+    // --ref mode: use snapshot ref to type by backendNodeId
+    if let Some(ref_str) = ref_id {
+        let mut driver = create_browser_driver(cli, config).await?;
+        apply_resource_blocking(cli, &mut driver).await;
+        let backend_node_id = resolve_snapshot_ref(&mut driver, ref_str).await?;
+
+        if human {
+            // Human-like typing with natural delays
+            let delays = crate::browser::human_input::typing_delays(text, false);
+            driver.focus_by_node_id(backend_node_id).await?;
+            for (ch, delay_ms) in &delays {
+                // For backspace, we'd need special handling; for now just type chars
+                if *ch == '\u{0008}' {
+                    // Dispatch Backspace key event via JS
+                    if let Some(mgr) = driver.as_cdp_mut() {
+                        mgr.press_key(None, "Backspace").await?;
+                    }
+                } else {
+                    if let Some(mgr) = driver.as_cdp_mut() {
+                        mgr.dispatch_key_char(None, *ch).await?;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+        } else {
+            driver.type_by_node_id(backend_node_id, text).await?;
+        }
+
+        let label = format!("ref={}", ref_str);
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({ "success": true, "ref": ref_str, "text": text })
+            );
+        } else {
+            println!("{} Typed into: {}", "✓".green(), label);
+        }
+        return Ok(());
+    }
+
+    let selector = selector.unwrap();
+
+    if cli.extension {
         if cli.camofox {
-            // Route through Extension Bridge with Camoufox backend
             extension_send(
                 cli,
-                config,
                 "Camoufox.type",
                 serde_json::json!({ "selector": selector, "text": text }),
             )
@@ -1454,7 +1504,7 @@ async fn type_text(
                 }})()"#,
                 wait_ms, resolve_js
             );
-            let found = extension_eval(cli, config, &poll_js).await?;
+            let found = extension_eval(cli, &poll_js).await?;
             if found.as_bool() != Some(true) {
                 return Err(ActionbookError::Timeout(format!(
                     "Element not found within {}ms (extension mode): {}",
@@ -1485,7 +1535,7 @@ async fn type_text(
             resolve_js, escaped_text
         );
 
-        let result = extension_eval(cli, config, &type_js).await?;
+        let result = extension_eval(cli, &type_js).await?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             let err = result
                 .get("error")
@@ -1510,6 +1560,7 @@ async fn type_text(
 
     // Use BrowserDriver for multi-backend support (CDP or Camoufox)
     let mut driver = create_browser_driver(cli, config).await?;
+    apply_resource_blocking(cli, &mut driver).await;
 
     // Wait is only supported for CDP backend
     if wait_ms > 0 {
@@ -1517,10 +1568,27 @@ async fn type_text(
             mgr.wait_for_element(effective_profile_arg(cli, config), selector, wait_ms)
                 .await?;
         }
-        // Camoufox: snapshot refresh handles waiting implicitly
     }
 
-    driver.type_text(selector, text).await?;
+    if human {
+        // Human-like typing: focus first, then type char by char with delays
+        driver.focus(selector).await?;
+        let delays = crate::browser::human_input::typing_delays(text, false);
+        for (ch, delay_ms) in &delays {
+            if *ch == '\u{0008}' {
+                if let Some(mgr) = driver.as_cdp_mut() {
+                    mgr.press_key(None, "Backspace").await?;
+                }
+            } else {
+                if let Some(mgr) = driver.as_cdp_mut() {
+                    mgr.dispatch_key_char(None, *ch).await?;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+        }
+    } else {
+        driver.type_text(selector, text).await?;
+    }
 
     if cli.json {
         println!(
@@ -1533,19 +1601,50 @@ async fn type_text(
             })
         );
     } else {
-        let backend_label = if driver.is_camofox() {
-            " (camoufox)"
-        } else {
-            ""
-        };
+        let backend_label = if driver.is_camofox() { " (camoufox)" } else { "" };
         println!("{} Typed into: {}{}", "✓".green(), selector, backend_label);
     }
 
     Ok(())
 }
 
-async fn fill(cli: &Cli, config: &Config, selector: &str, text: &str, wait_ms: u64) -> Result<()> {
-    if is_extension_mode(cli, config) {
+async fn fill(
+    cli: &Cli,
+    config: &Config,
+    selector: Option<&str>,
+    text: &str,
+    wait_ms: u64,
+    ref_id: Option<&str>,
+) -> Result<()> {
+    // Require either selector or --ref
+    if selector.is_none() && ref_id.is_none() {
+        return Err(ActionbookError::Other(
+            "Either a CSS selector or --ref must be provided".to_string(),
+        ));
+    }
+
+    // --ref mode: use snapshot ref to fill by backendNodeId
+    if let Some(ref_str) = ref_id {
+        let mut driver = create_browser_driver(cli, config).await?;
+        apply_resource_blocking(cli, &mut driver).await;
+        let backend_node_id = resolve_snapshot_ref(&mut driver, ref_str).await?;
+
+        driver.fill_by_node_id(backend_node_id, text).await?;
+
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({ "success": true, "ref": ref_str, "text": text })
+            );
+        } else {
+            println!("{} Filled: ref={}", "✓".green(), ref_str);
+        }
+        return Ok(());
+    }
+
+    let selector = selector.unwrap();
+
+    if cli.extension {
         let resolve_js = js_resolve_selector(selector);
         let escaped_text = escape_js_string(text);
 
@@ -1562,7 +1661,7 @@ async fn fill(cli: &Cli, config: &Config, selector: &str, text: &str, wait_ms: u
                 }})()"#,
                 wait_ms, resolve_js
             );
-            let found = extension_eval(cli, config, &poll_js).await?;
+            let found = extension_eval(cli, &poll_js).await?;
             if found.as_bool() != Some(true) {
                 return Err(ActionbookError::Timeout(format!(
                     "Element not found within {}ms (extension mode): {}",
@@ -1597,7 +1696,7 @@ async fn fill(cli: &Cli, config: &Config, selector: &str, text: &str, wait_ms: u
             resolve_js, escaped_text, escaped_text, escaped_text
         );
 
-        let result = extension_eval(cli, config, &fill_js).await?;
+        let result = extension_eval(cli, &fill_js).await?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             let err = result
                 .get("error")
@@ -1649,7 +1748,7 @@ async fn fill(cli: &Cli, config: &Config, selector: &str, text: &str, wait_ms: u
 }
 
 async fn select(cli: &Cli, config: &Config, selector: &str, value: &str) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         let resolve_js = js_resolve_selector(selector);
         let escaped_value = escape_js_string(value);
         let select_js = format!(
@@ -1665,7 +1764,7 @@ async fn select(cli: &Cli, config: &Config, selector: &str, value: &str) -> Resu
             resolve_js, escaped_value
         );
 
-        let result = extension_eval(cli, config, &select_js).await?;
+        let result = extension_eval(cli, &select_js).await?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             let err = result
                 .get("error")
@@ -1715,7 +1814,7 @@ async fn select(cli: &Cli, config: &Config, selector: &str, value: &str) -> Resu
 }
 
 async fn hover(cli: &Cli, config: &Config, selector: &str) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         let resolve_js = js_resolve_selector(selector);
         let hover_js = format!(
             r#"(function() {{
@@ -1729,7 +1828,7 @@ async fn hover(cli: &Cli, config: &Config, selector: &str) -> Result<()> {
             resolve_js
         );
 
-        let result = extension_eval(cli, config, &hover_js).await?;
+        let result = extension_eval(cli, &hover_js).await?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             let err = result
                 .get("error")
@@ -1773,7 +1872,7 @@ async fn hover(cli: &Cli, config: &Config, selector: &str) -> Result<()> {
 }
 
 async fn focus(cli: &Cli, config: &Config, selector: &str) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         let resolve_js = js_resolve_selector(selector);
         let focus_js = format!(
             r#"(function() {{
@@ -1785,7 +1884,7 @@ async fn focus(cli: &Cli, config: &Config, selector: &str) -> Result<()> {
             resolve_js
         );
 
-        let result = extension_eval(cli, config, &focus_js).await?;
+        let result = extension_eval(cli, &focus_js).await?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             let err = result
                 .get("error")
@@ -1829,7 +1928,7 @@ async fn focus(cli: &Cli, config: &Config, selector: &str) -> Result<()> {
 }
 
 async fn press(cli: &Cli, config: &Config, key: &str) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         let escaped_key = escape_js_string(key);
         let press_js = format!(
             r#"(function() {{
@@ -1865,7 +1964,7 @@ async fn press(cli: &Cli, config: &Config, key: &str) -> Result<()> {
             escaped_key
         );
 
-        let result = extension_eval(cli, config, &press_js).await?;
+        let result = extension_eval(cli, &press_js).await?;
         if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
             return Err(ActionbookError::ExtensionError(
                 "Press failed (extension mode)".to_string(),
@@ -1873,7 +1972,10 @@ async fn press(cli: &Cli, config: &Config, key: &str) -> Result<()> {
         }
 
         if cli.json {
-            println!("{}", serde_json::json!({ "success": true, "key": key }));
+            println!(
+                "{}",
+                serde_json::json!({ "success": true, "key": key })
+            );
         } else {
             println!("{} Pressed: {} (extension)", "✓".green(), key);
         }
@@ -1901,17 +2003,19 @@ async fn press(cli: &Cli, config: &Config, key: &str) -> Result<()> {
 }
 
 async fn screenshot(cli: &Cli, config: &Config, path: &str, full_page: bool) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         if cli.camofox {
             // Route through Extension Bridge with Camoufox backend
-            let result =
-                extension_send(cli, config, "Camoufox.screenshot", serde_json::json!({})).await?;
-            let b64_data = result.get("data").and_then(|d| d.as_str()).ok_or_else(|| {
-                ActionbookError::ExtensionError(
-                    "Screenshot response missing 'data' field (extension + camoufox mode)"
-                        .to_string(),
-                )
-            })?;
+            let result = extension_send(cli, "Camoufox.screenshot", serde_json::json!({})).await?;
+            let b64_data = result
+                .get("data")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| {
+                    ActionbookError::ExtensionError(
+                        "Screenshot response missing 'data' field (extension + camoufox mode)"
+                            .to_string(),
+                    )
+                })?;
 
             let screenshot_data = base64::engine::general_purpose::STANDARD
                 .decode(b64_data)
@@ -1930,7 +2034,10 @@ async fn screenshot(cli: &Cli, config: &Config, path: &str, full_page: bool) -> 
             fs::write(path, screenshot_data)?;
 
             if cli.json {
-                println!("{}", serde_json::json!({ "success": true, "path": path }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "success": true, "path": path })
+                );
             } else {
                 println!(
                     "{} Screenshot saved: {} (extension + camoufox)",
@@ -1947,12 +2054,15 @@ async fn screenshot(cli: &Cli, config: &Config, path: &str, full_page: bool) -> 
             params["captureBeyondViewport"] = serde_json::json!(true);
         }
 
-        let result = extension_send(cli, config, "Page.captureScreenshot", params).await?;
-        let b64_data = result.get("data").and_then(|d| d.as_str()).ok_or_else(|| {
-            ActionbookError::ExtensionError(
-                "Screenshot response missing 'data' field (extension mode)".to_string(),
-            )
-        })?;
+        let result = extension_send(cli, "Page.captureScreenshot", params).await?;
+        let b64_data = result
+            .get("data")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| {
+                ActionbookError::ExtensionError(
+                    "Screenshot response missing 'data' field (extension mode)".to_string(),
+                )
+            })?;
 
         let screenshot_data = base64::engine::general_purpose::STANDARD
             .decode(b64_data)
@@ -2031,11 +2141,7 @@ async fn screenshot(cli: &Cli, config: &Config, path: &str, full_page: bool) -> 
         } else {
             ""
         };
-        let backend_label = if driver.is_camofox() {
-            " (camoufox)"
-        } else {
-            ""
-        };
+        let backend_label = if driver.is_camofox() { " (camoufox)" } else { "" };
         println!(
             "{} Screenshot saved{}: {}{}",
             "✓".green(),
@@ -2049,13 +2155,16 @@ async fn screenshot(cli: &Cli, config: &Config, path: &str, full_page: bool) -> 
 }
 
 async fn pdf(cli: &Cli, config: &Config, path: &str) -> Result<()> {
-    if is_extension_mode(cli, config) {
-        let result = extension_send(cli, config, "Page.printToPDF", serde_json::json!({})).await?;
-        let b64_data = result.get("data").and_then(|d| d.as_str()).ok_or_else(|| {
-            ActionbookError::ExtensionError(
-                "PDF response missing 'data' field (extension mode)".to_string(),
-            )
-        })?;
+    if cli.extension {
+        let result = extension_send(cli, "Page.printToPDF", serde_json::json!({})).await?;
+        let b64_data = result
+            .get("data")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| {
+                ActionbookError::ExtensionError(
+                    "PDF response missing 'data' field (extension mode)".to_string(),
+                )
+            })?;
 
         let pdf_data = base64::engine::general_purpose::STANDARD
             .decode(b64_data)
@@ -2074,7 +2183,10 @@ async fn pdf(cli: &Cli, config: &Config, path: &str) -> Result<()> {
         fs::write(path, pdf_data)?;
 
         if cli.json {
-            println!("{}", serde_json::json!({ "success": true, "path": path }));
+            println!(
+                "{}",
+                serde_json::json!({ "success": true, "path": path })
+            );
         } else {
             println!("{} PDF saved: {} (extension)", "✓".green(), path);
         }
@@ -2109,10 +2221,9 @@ async fn pdf(cli: &Cli, config: &Config, path: &str) -> Result<()> {
 }
 
 async fn eval(cli: &Cli, config: &Config, code: &str) -> Result<()> {
-    let value = if is_extension_mode(cli, config) {
+    let value = if cli.extension {
         let result = extension_send(
             cli,
-            config,
             "Runtime.evaluate",
             serde_json::json!({
                 "expression": code,
@@ -2149,12 +2260,11 @@ async fn eval(cli: &Cli, config: &Config, code: &str) -> Result<()> {
 }
 
 async fn html(cli: &Cli, config: &Config, selector: Option<&str>) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         if cli.camofox {
             // Route through Extension Bridge with Camoufox backend
             // Camoufox returns accessibility tree instead of HTML
-            let result =
-                extension_send(cli, config, "Camoufox.html", serde_json::json!({})).await?;
+            let result = extension_send(cli, "Camoufox.html", serde_json::json!({})).await?;
 
             if cli.json {
                 println!("{}", serde_json::to_string(&result)?);
@@ -2179,7 +2289,7 @@ async fn html(cli: &Cli, config: &Config, selector: Option<&str>) -> Result<()> 
             None => "document.documentElement.outerHTML".to_string(),
         };
 
-        let value = extension_eval(cli, config, &js).await?;
+        let value = extension_eval(cli, &js).await?;
         let html = value.as_str().unwrap_or("").to_string();
 
         if selector.is_some() && html.is_empty() {
@@ -2233,8 +2343,9 @@ async fn html(cli: &Cli, config: &Config, selector: Option<&str>) -> Result<()> 
     Ok(())
 }
 
-async fn text(cli: &Cli, config: &Config, selector: Option<&str>) -> Result<()> {
-    if is_extension_mode(cli, config) {
+async fn text(cli: &Cli, config: &Config, selector: Option<&str>, mode: &str) -> Result<()> {
+    if cli.extension {
+        // Extension mode: always uses JS-based extraction
         let js = match selector {
             Some(sel) => {
                 let resolve_js = js_resolve_selector(sel);
@@ -2246,10 +2357,17 @@ async fn text(cli: &Cli, config: &Config, selector: Option<&str>) -> Result<()> 
                     resolve_js
                 )
             }
-            None => "document.body.innerText".to_string(),
+            None => {
+                if mode == "readability" {
+                    // Use readability extraction in extension mode
+                    crate::browser::readability::READABILITY_JS.to_string()
+                } else {
+                    "document.body.innerText".to_string()
+                }
+            }
         };
 
-        let value = extension_eval(cli, config, &js).await?;
+        let value = extension_eval(cli, &js).await?;
         let text = value.as_str().unwrap_or("").to_string();
 
         if selector.is_some() && value.is_null() {
@@ -2260,20 +2378,41 @@ async fn text(cli: &Cli, config: &Config, selector: Option<&str>) -> Result<()> 
         }
 
         if cli.json {
-            println!("{}", serde_json::json!({ "text": text }));
+            println!("{}", serde_json::json!({ "text": text, "mode": mode }));
         } else {
             println!("{}", text);
         }
         return Ok(());
     }
 
-    let session_manager = create_session_manager(cli, config);
-    let text = session_manager
-        .get_text(effective_profile_arg(cli, config), selector)
-        .await?;
+    // If a selector is provided, use the old get_text method (raw innerText of element)
+    if selector.is_some() {
+        let session_manager = create_session_manager(cli, config);
+        let text = session_manager
+            .get_text(effective_profile_arg(cli, config), selector)
+            .await?;
+
+        if cli.json {
+            println!("{}", serde_json::json!({ "text": text, "mode": "raw" }));
+        } else {
+            println!("{}", text);
+        }
+        return Ok(());
+    }
+
+    // Use BrowserDriver with readability/raw mode
+    let mut driver = create_browser_driver(cli, config).await?;
+    apply_resource_blocking(cli, &mut driver).await;
+
+    let extraction_mode = match mode {
+        "raw" => crate::browser::TextExtractionMode::Raw,
+        _ => crate::browser::TextExtractionMode::Readability,
+    };
+
+    let text = driver.get_readable_text(extraction_mode).await?;
 
     if cli.json {
-        println!("{}", serde_json::json!({ "text": text }));
+        println!("{}", serde_json::json!({ "text": text, "mode": mode }));
     } else {
         println!("{}", text);
     }
@@ -2281,323 +2420,325 @@ async fn text(cli: &Cli, config: &Config, selector: Option<&str>) -> Result<()> 
     Ok(())
 }
 
-async fn snapshot(cli: &Cli, config: &Config) -> Result<()> {
-    // Build accessibility tree with proper tree structure, filtering, and refs.
-    // Modeled after agent-browser's snapshot.ts output format.
-    // Text nodes are captured as { role: "text", content: "..." } children.
-    // Links include { url: "href" }. Inline tags use their tag name as role.
-    let js = r#"
-        (function() {
-            // Tags to skip entirely
-            const SKIP_TAGS = new Set([
-                'script', 'style', 'noscript', 'template', 'svg',
-                'path', 'defs', 'clippath', 'lineargradient', 'stop',
-                'meta', 'link', 'br', 'wbr'
-            ]);
+/// Get the path for persisting the last snapshot (for --diff across CLI invocations)
+fn snapshot_cache_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".actionbook").join("last_snapshot.json"))
+}
 
-            // Inline tags - use tag name as role
-            const INLINE_TAGS = new Set([
-                'strong', 'b', 'em', 'i', 'code', 'span', 'small',
-                'sup', 'sub', 'abbr', 'mark', 'u', 's', 'del', 'ins',
-                'time', 'q', 'cite', 'dfn', 'var', 'samp', 'kbd'
-            ]);
+/// Load the last snapshot from disk
+fn load_last_snapshot() -> Option<Vec<crate::browser::snapshot::A11yNode>> {
+    let path = snapshot_cache_path()?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
 
-            // Interactive roles get [ref=eN]
-            const INTERACTIVE_ROLES = new Set([
-                'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox',
-                'listbox', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
-                'option', 'searchbox', 'slider', 'spinbutton', 'switch',
-                'tab', 'treeitem'
-            ]);
+/// Save the current snapshot to disk
+fn save_last_snapshot(nodes: &[crate::browser::snapshot::A11yNode]) {
+    if let Some(path) = snapshot_cache_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = serde_json::to_string(nodes)
+            .map(|json| std::fs::write(&path, json));
+    }
+}
 
-            // Content roles also get refs when they have a name
-            const CONTENT_ROLES = new Set([
-                'heading', 'cell', 'gridcell', 'columnheader', 'rowheader',
-                'listitem', 'article', 'region', 'main', 'navigation', 'img'
-            ]);
+async fn snapshot(
+    cli: &Cli,
+    config: &Config,
+    interactive: bool,
+    cursor: bool,
+    compact: bool,
+    format: &str,
+    depth: Option<usize>,
+    selector: Option<&str>,
+    diff: bool,
+    max_tokens: Option<usize>,
+) -> Result<()> {
+    use crate::browser::snapshot::{
+        self, SnapshotFilter, SnapshotFormat,
+    };
 
-            // Map HTML tags to ARIA roles
-            function getRole(el) {
-                const explicit = el.getAttribute('role');
-                if (explicit) return explicit.toLowerCase();
-                const tag = el.tagName.toLowerCase();
-                // Inline tags use their tag name as role
-                if (INLINE_TAGS.has(tag)) return tag;
-                const roleMap = {
-                    'a': el.hasAttribute('href') ? 'link' : 'generic',
-                    'button': 'button',
-                    'input': getInputRole(el),
-                    'select': 'combobox',
-                    'textarea': 'textbox',
-                    'img': 'img',
-                    'h1': 'heading', 'h2': 'heading', 'h3': 'heading',
-                    'h4': 'heading', 'h5': 'heading', 'h6': 'heading',
-                    'nav': 'navigation',
-                    'main': 'main',
-                    'header': 'banner',
-                    'footer': 'contentinfo',
-                    'aside': 'complementary',
-                    'form': 'form',
-                    'table': 'table',
-                    'thead': 'rowgroup', 'tbody': 'rowgroup', 'tfoot': 'rowgroup',
-                    'tr': 'row',
-                    'th': 'columnheader',
-                    'td': 'cell',
-                    'ul': 'list', 'ol': 'list',
-                    'li': 'listitem',
-                    'details': 'group',
-                    'summary': 'button',
-                    'dialog': 'dialog',
-                    'section': el.hasAttribute('aria-label') || el.hasAttribute('aria-labelledby') ? 'region' : 'generic',
-                    'article': 'article'
-                };
-                return roleMap[tag] || 'generic';
+    // Parse filter from boolean flag
+    let snap_filter = if interactive {
+        SnapshotFilter::Interactive
+    } else {
+        SnapshotFilter::All
+    };
+
+    // Parse format
+    let snap_format = match format {
+        "compact" => SnapshotFormat::Compact,
+        "text" => SnapshotFormat::Text,
+        "json" => SnapshotFormat::Json,
+        f => return Err(ActionbookError::Other(format!("Unknown format: '{}'. Use 'compact', 'text', or 'json'.", f))),
+    };
+
+    // Extension mode: fall back to the old JS-based snapshot
+    if cli.extension {
+        return snapshot_js_fallback(cli, config, snap_format).await;
+    }
+
+    // Use CDP Accessibility.getFullAXTree
+    let mut driver = create_browser_driver(cli, config).await?;
+    apply_resource_blocking(cli, &mut driver).await;
+
+    // If scoping by CSS selector, resolve to backendNodeId first
+    let scope_backend_id = if let Some(sel) = selector {
+        driver.get_backend_node_id(sel).await?
+    } else {
+        None
+    };
+
+    let raw = driver.get_accessibility_tree_raw().await?;
+    let (mut nodes, _cache) = snapshot::parse_ax_tree(&raw, snap_filter, depth, scope_backend_id);
+
+    // Apply compact tree filtering (-c): remove empty structural elements
+    if compact {
+        nodes = snapshot::compact_tree_nodes(&nodes);
+    }
+
+    // Append cursor-interactive elements (-C)
+    if cursor {
+        let cursor_nodes = snapshot::find_cursor_interactive_elements(&mut driver, selector).await?;
+        if !cursor_nodes.is_empty() {
+            // Continue ref numbering from where AX tree left off
+            let next_ref = nodes.len();
+            for (i, cn) in cursor_nodes.into_iter().enumerate() {
+                nodes.push(snapshot::A11yNode {
+                    ref_id: format!("e{}", next_ref + i),
+                    role: if cn.has_cursor_pointer || cn.has_onclick {
+                        "clickable".to_string()
+                    } else {
+                        "focusable".to_string()
+                    },
+                    name: cn.text,
+                    value: None,
+                    depth: 0,
+                    disabled: false,
+                    focused: false,
+                    backend_node_id: -1,
+                });
             }
+        }
+    }
 
-            function getInputRole(el) {
-                const type = (el.getAttribute('type') || 'text').toLowerCase();
-                const map = {
-                    'text': 'textbox', 'email': 'textbox', 'password': 'textbox',
-                    'search': 'searchbox', 'tel': 'textbox', 'url': 'textbox',
-                    'number': 'spinbutton',
-                    'checkbox': 'checkbox', 'radio': 'radio',
-                    'submit': 'button', 'reset': 'button', 'button': 'button',
-                    'range': 'slider'
-                };
-                return map[type] || 'textbox';
+    // Handle --diff mode
+    if diff {
+        let prev_nodes = load_last_snapshot();
+        save_last_snapshot(&nodes);
+
+        match prev_nodes {
+            None => {
+                // First snapshot, no diff available
+                if cli.json {
+                    println!("{}", serde_json::json!({
+                        "message": "First snapshot captured. Run again with --diff to see changes.",
+                        "nodeCount": nodes.len()
+                    }));
+                } else {
+                    println!("{} First snapshot captured ({} nodes). Run again with --diff to see changes.",
+                        "i".blue(), nodes.len());
+                }
             }
+            Some(prev) => {
+                let (added, changed, removed) = snapshot::diff_snapshots(&prev, &nodes);
 
-            function getAccessibleName(el) {
-                const ariaLabel = el.getAttribute('aria-label');
-                if (ariaLabel) return ariaLabel.trim();
-
-                const labelledBy = el.getAttribute('aria-labelledby');
-                if (labelledBy) {
-                    const label = document.getElementById(labelledBy);
-                    if (label) return label.textContent?.trim()?.substring(0, 100) || '';
-                }
-
-                const tag = el.tagName.toLowerCase();
-                if (tag === 'img') return el.getAttribute('alt') || '';
-                if (tag === 'input' || tag === 'textarea' || tag === 'select') {
-                    if (el.id) {
-                        const label = document.querySelector('label[for="' + el.id + '"]');
-                        if (label) return label.textContent?.trim()?.substring(0, 100) || '';
-                    }
-                    return el.getAttribute('placeholder') || el.getAttribute('title') || '';
-                }
-                if (tag === 'a' || tag === 'button' || tag === 'summary') {
-                    // For links/buttons, don't use textContent as name if we'll walk childNodes
-                    // Only use aria-label or explicit label
-                    return '';
-                }
-                if (['h1','h2','h3','h4','h5','h6'].includes(tag)) {
-                    return el.textContent?.trim()?.substring(0, 150) || '';
-                }
-
-                const title = el.getAttribute('title');
-                if (title) return title.trim();
-
-                return '';
-            }
-
-            function isHidden(el) {
-                if (el.hidden) return true;
-                if (el.getAttribute('aria-hidden') === 'true') return true;
-                const style = el.style;
-                if (style.display === 'none' || style.visibility === 'hidden') return true;
-                if (el.offsetParent === null && el.tagName.toLowerCase() !== 'body' &&
-                    getComputedStyle(el).position !== 'fixed' && getComputedStyle(el).position !== 'sticky') {
-                    const cs = getComputedStyle(el);
-                    if (cs.display === 'none' || cs.visibility === 'hidden') return true;
-                }
-                return false;
-            }
-
-            let refCounter = 0;
-
-            function walk(el, depth) {
-                if (depth > 15) return null;
-                const tag = el.tagName.toLowerCase();
-                if (SKIP_TAGS.has(tag)) return null;
-                if (isHidden(el)) return null;
-
-                const role = getRole(el);
-                const name = getAccessibleName(el);
-                const isInteractive = INTERACTIVE_ROLES.has(role);
-                const isContent = CONTENT_ROLES.has(role);
-                const shouldRef = isInteractive || (isContent && name);
-
-                let ref = null;
-                if (shouldRef) {
-                    refCounter++;
-                    ref = 'e' + refCounter;
-                }
-
-                // Collect children by walking childNodes (captures text nodes)
-                const children = [];
-                for (const child of el.childNodes) {
-                    if (child.nodeType === 1) {
-                        // Element node
-                        const c = walk(child, depth + 1);
-                        if (c) children.push(c);
-                    } else if (child.nodeType === 3) {
-                        // Text node
-                        const t = child.textContent?.trim();
-                        if (t) {
-                            const content = t.length > 200 ? t.substring(0, 200) + '...' : t;
-                            children.push({ role: 'text', content });
+                if cli.json {
+                    println!("{}", serde_json::json!({
+                        "added": added.len(),
+                        "changed": changed.len(),
+                        "removed": removed.len(),
+                        "addedNodes": format_nodes_for_json(&added),
+                        "changedNodes": format_nodes_for_json(&changed),
+                        "removedNodes": format_nodes_for_json(&removed),
+                    }));
+                } else {
+                    if added.is_empty() && changed.is_empty() && removed.is_empty() {
+                        println!("{} No changes detected", "=".blue());
+                    } else {
+                        if !added.is_empty() {
+                            println!("{} Added ({}):", "+".green(), added.len());
+                            print!("{}", snapshot::format_compact(&added));
+                        }
+                        if !changed.is_empty() {
+                            println!("{} Changed ({}):", "~".yellow(), changed.len());
+                            print!("{}", snapshot::format_compact(&changed));
+                        }
+                        if !removed.is_empty() {
+                            println!("{} Removed ({}):", "-".red(), removed.len());
+                            print!("{}", snapshot::format_compact(&removed));
                         }
                     }
                 }
-
-                // Skip generic elements with no name, no ref, and only one child (pass-through)
-                if (role === 'generic' && !name && !ref && children.length === 1) {
-                    return children[0];
-                }
-
-                // Skip generic elements with no content at all
-                if (role === 'generic' && !name && !ref && children.length === 0) {
-                    return null;
-                }
-
-                // Build node info
-                const node = { role };
-                if (name) node.name = name;
-                if (ref) node.ref = ref;
-                if (children.length > 0) node.children = children;
-
-                // URL for links
-                if (role === 'link') {
-                    const href = el.getAttribute('href');
-                    if (href) node.url = href;
-                }
-
-                // Extra attributes
-                if (role === 'heading') {
-                    const level = tag.match(/^h(\d)$/);
-                    if (level) node.level = parseInt(level[1]);
-                }
-                if (role === 'textbox' || role === 'searchbox') {
-                    node.value = el.value || '';
-                }
-                if (role === 'checkbox' || role === 'radio' || role === 'switch') {
-                    node.checked = el.checked || false;
-                }
-
-                return node;
             }
+        }
+        return Ok(());
+    }
 
-            const tree = walk(document.body, 0);
-            return { tree, refCount: refCounter };
-        })()
-    "#;
+    // Store for future --diff
+    save_last_snapshot(&nodes);
 
-    let value = if is_extension_mode(cli, config) {
-        extension_eval(cli, config, js).await?
+    // Apply token truncation if requested
+    let (nodes, truncated) = if let Some(max_tok) = max_tokens {
+        snapshot::truncate_to_tokens(&nodes, max_tok, snap_format)
     } else {
-        let session_manager = create_session_manager(cli, config);
-        session_manager
-            .eval_on_page(effective_profile_arg(cli, config), js)
-            .await?
+        (nodes, false)
     };
 
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
-        // Render tree as indented text (matching agent-browser format)
-        if let Some(tree) = value.get("tree") {
-            let output = render_snapshot_tree(tree, 0);
-            print!("{}", output);
+    // Output
+    if cli.json || snap_format == SnapshotFormat::Json {
+        let mut json_val = serde_json::to_value(&nodes)?;
+        if truncated {
+            if let Some(obj) = json_val.as_object_mut() {
+                // Wrap in an object with metadata
+                let wrapped = serde_json::json!({
+                    "nodes": obj.clone(),
+                    "truncated": true,
+                    "maxTokens": max_tokens.unwrap_or(0),
+                });
+                println!("{}", serde_json::to_string_pretty(&wrapped)?);
+            } else {
+                let wrapped = serde_json::json!({
+                    "nodes": json_val,
+                    "truncated": true,
+                    "maxTokens": max_tokens.unwrap_or(0),
+                });
+                println!("{}", serde_json::to_string_pretty(&wrapped)?);
+            }
         } else {
-            println!("(empty)");
+            println!("{}", serde_json::to_string_pretty(&nodes)?);
+        }
+    } else {
+        let output = match snap_format {
+            SnapshotFormat::Compact => snapshot::format_compact(&nodes),
+            SnapshotFormat::Text => snapshot::format_text(&nodes),
+            SnapshotFormat::Json => serde_json::to_string_pretty(&nodes)?,
+        };
+        let tokens = snapshot::estimate_tokens(&output, snap_format);
+        print!("{}", output);
+        if truncated {
+            println!("(truncated to ~{} tokens)", max_tokens.unwrap_or(0));
+        }
+        if cli.verbose {
+            eprintln!("--- {} nodes, ~{} tokens ---", nodes.len(), tokens);
         }
     }
 
     Ok(())
 }
 
-/// Render a snapshot tree node as indented text lines.
-/// Output format matches agent-browser:
-///   - heading "Title" [ref=e1] [level=1]
-///   - button "Submit" [ref=e2]
-///   - link "Home" [ref=e3]:
-///     - /url: https://example.com
-///     - text: Home
-///   - text: Hello world
-fn render_snapshot_tree(node: &serde_json::Value, depth: usize) -> String {
-    let mut output = String::new();
-    let indent = "  ".repeat(depth);
-
-    let role = node
-        .get("role")
-        .and_then(|v| v.as_str())
-        .unwrap_or("generic");
-
-    // Text nodes: - text: content
-    if role == "text" {
-        if let Some(content) = node.get("content").and_then(|v| v.as_str()) {
-            if !content.is_empty() {
-                output.push_str(&format!("{}- text: {}\n", indent, content));
+/// Format A11yNode list as JSON-friendly values
+fn format_nodes_for_json(nodes: &[crate::browser::snapshot::A11yNode]) -> Vec<serde_json::Value> {
+    nodes
+        .iter()
+        .map(|n| {
+            let mut obj = serde_json::json!({
+                "ref": n.ref_id,
+                "role": n.role,
+                "name": n.name,
+            });
+            if let Some(ref v) = n.value {
+                obj["value"] = serde_json::json!(v);
             }
+            if n.focused {
+                obj["focused"] = serde_json::json!(true);
+            }
+            if n.disabled {
+                obj["disabled"] = serde_json::json!(true);
+            }
+            obj
+        })
+        .collect()
+}
+
+/// Fallback: JS-based snapshot for extension mode (no CDP access)
+async fn snapshot_js_fallback(
+    cli: &Cli,
+    _config: &Config,
+    format: crate::browser::snapshot::SnapshotFormat,
+) -> Result<()> {
+    let js = r#"
+        (function() {
+            const SKIP_TAGS = new Set(['script','style','noscript','template','svg','path','defs','clippath','lineargradient','stop','meta','link','br','wbr']);
+            const INTERACTIVE_ROLES = new Set(['button','link','textbox','checkbox','radio','combobox','listbox','menuitem','menuitemcheckbox','menuitemradio','option','searchbox','slider','spinbutton','switch','tab','treeitem']);
+            let refCounter = 0;
+            function getRole(el) {
+                const explicit = el.getAttribute('role');
+                if (explicit) return explicit.toLowerCase();
+                const tag = el.tagName.toLowerCase();
+                const map = {'a': el.hasAttribute('href') ? 'link' : 'generic','button':'button','input':getInputRole(el),'select':'combobox','textarea':'textbox','img':'img','h1':'heading','h2':'heading','h3':'heading','h4':'heading','h5':'heading','h6':'heading','nav':'navigation','main':'main'};
+                return map[tag] || 'generic';
+            }
+            function getInputRole(el) {
+                const t = (el.getAttribute('type') || 'text').toLowerCase();
+                const m = {'text':'textbox','email':'textbox','password':'textbox','search':'searchbox','checkbox':'checkbox','radio':'radio','submit':'button','range':'slider','number':'spinbutton'};
+                return m[t] || 'textbox';
+            }
+            function getName(el) {
+                return el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || '';
+            }
+            function walk(el, depth) {
+                if (depth > 15) return [];
+                const tag = el.tagName?.toLowerCase();
+                if (!tag || SKIP_TAGS.has(tag)) return [];
+                if (el.hidden || el.getAttribute('aria-hidden') === 'true') return [];
+                const role = getRole(el);
+                if (role === 'generic' || role === 'none') {
+                    let results = [];
+                    for (const child of el.children) results.push(...walk(child, depth));
+                    return results;
+                }
+                const name = getName(el);
+                const isInteractive = INTERACTIVE_ROLES.has(role);
+                const ref = isInteractive ? 'e' + (refCounter++) : 'e' + (refCounter++);
+                const node = { ref, role, name, depth };
+                if (role === 'textbox' || role === 'searchbox') node.value = el.value || '';
+                if (el === document.activeElement) node.focused = true;
+                if (el.disabled) node.disabled = true;
+                let results = [node];
+                for (const child of el.children) results.push(...walk(child, depth + 1));
+                return results;
+            }
+            return walk(document.body, 0);
+        })()
+    "#;
+
+    let value = extension_eval(cli, js).await?;
+    let empty = vec![];
+    let nodes_json = value.as_array().unwrap_or(&empty);
+
+    if cli.json || format == crate::browser::snapshot::SnapshotFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        for node in nodes_json {
+            let ref_id = node.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let role = node.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            print!("{}:{}", ref_id, role);
+            if !name.is_empty() {
+                print!(" \"{}\"", name);
+            }
+            if let Some(val) = node.get("value").and_then(|v| v.as_str()) {
+                if !val.is_empty() {
+                    print!(" val=\"{}\"", val);
+                }
+            }
+            let mut flags = Vec::new();
+            if node.get("focused").and_then(|v| v.as_bool()) == Some(true) { flags.push("focused"); }
+            if node.get("disabled").and_then(|v| v.as_bool()) == Some(true) { flags.push("disabled"); }
+            if !flags.is_empty() {
+                print!(" [{}]", flags.join(","));
+            }
+            println!();
         }
-        return output;
     }
 
-    let name = node.get("name").and_then(|v| v.as_str());
-    let ref_id = node.get("ref").and_then(|v| v.as_str());
-    let url = node.get("url").and_then(|v| v.as_str());
-    let children = node.get("children").and_then(|v| v.as_array());
-    let has_children = children.is_some_and(|c| !c.is_empty());
-
-    // Build the line: - role "name" [ref=eN] [extra]
-    let mut line = format!("{}- {}", indent, role);
-
-    if let Some(n) = name {
-        line.push_str(&format!(" \"{}\"", n));
-    }
-
-    if let Some(r) = ref_id {
-        line.push_str(&format!(" [ref={}]", r));
-    }
-
-    // Extra attributes
-    if let Some(level) = node.get("level").and_then(|v| v.as_u64()) {
-        line.push_str(&format!(" [level={}]", level));
-    }
-    if let Some(checked) = node.get("checked").and_then(|v| v.as_bool()) {
-        line.push_str(&format!(" [checked={}]", checked));
-    }
-    if let Some(val) = node.get("value").and_then(|v| v.as_str()) {
-        if !val.is_empty() {
-            line.push_str(&format!(" [value=\"{}\"]", val));
-        }
-    }
-
-    if has_children || url.is_some() {
-        line.push(':');
-    }
-
-    output.push_str(&line);
-    output.push('\n');
-
-    // URL for links
-    if let Some(u) = url {
-        output.push_str(&format!("{}  - /url: {}\n", indent, u));
-    }
-
-    // Children
-    if let Some(kids) = children {
-        for child in kids {
-            output.push_str(&render_snapshot_tree(child, depth + 1));
-        }
-    }
-
-    output
+    Ok(())
 }
 
 async fn inspect(cli: &Cli, config: &Config, x: f64, y: f64, desc: Option<&str>) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         // In extension mode, use JS elementFromPoint + gather info
         let inspect_js = format!(
             r#"(function() {{
@@ -2646,7 +2787,7 @@ async fn inspect(cli: &Cli, config: &Config, x: f64, y: f64, desc: Option<&str>)
             x, y
         );
 
-        let result = extension_eval(cli, config, &inspect_js).await?;
+        let result = extension_eval(cli, &inspect_js).await?;
 
         if result.get("outOfBounds").and_then(|v| v.as_bool()) == Some(true) {
             let vp = result.get("viewport").unwrap_or(&serde_json::Value::Null);
@@ -2663,11 +2804,7 @@ async fn inspect(cli: &Cli, config: &Config, x: f64, y: f64, desc: Option<&str>)
             } else {
                 println!(
                     "{} Coordinates ({}, {}) are outside viewport bounds ({}x{}) (extension)",
-                    "!".yellow(),
-                    x,
-                    y,
-                    vw as i32,
-                    vh as i32
+                    "!".yellow(), x, y, vw as i32, vh as i32
                 );
             }
             return Ok(());
@@ -2684,48 +2821,23 @@ async fn inspect(cli: &Cli, config: &Config, x: f64, y: f64, desc: Option<&str>)
             }
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
-            let found = result
-                .get("found")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let found = result.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
             if !found {
-                println!(
-                    "{} No element found at ({}, {}) (extension)",
-                    "!".yellow(),
-                    x,
-                    y
-                );
+                println!("{} No element found at ({}, {}) (extension)", "!".yellow(), x, y);
                 return Ok(());
             }
             if let Some(d) = desc {
                 println!("{} Inspecting: {} (extension)\n", "?".cyan(), d.bold());
             }
-            let tag = result
-                .get("tagName")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let id = result
-                .get("id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            let class = result
-                .get("className")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
+            let tag = result.get("tagName").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let id = result.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+            let class = result.get("className").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
             print!("{}", "Element: ".bold());
             print!("<{}", tag.cyan());
-            if let Some(i) = id {
-                print!(" id=\"{}\"", i.green());
-            }
-            if let Some(c) = class {
-                print!(" class=\"{}\"", c.yellow());
-            }
+            if let Some(i) = id { print!(" id=\"{}\"", i.green()); }
+            if let Some(c) = class { print!(" class=\"{}\"", c.yellow()); }
             println!(">");
-            if let Some(text) = result
-                .get("textContent")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
+            if let Some(text) = result.get("textContent").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 println!("{}", "Text:".bold());
                 println!("  {}", text.dimmed());
             }
@@ -2941,10 +3053,9 @@ async fn inspect(cli: &Cli, config: &Config, x: f64, y: f64, desc: Option<&str>)
 }
 
 async fn viewport(cli: &Cli, config: &Config) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         let value = extension_eval(
             cli,
-            config,
             "JSON.stringify({width: window.innerWidth, height: window.innerHeight})",
         )
         .await?;
@@ -2953,8 +3064,14 @@ async fn viewport(cli: &Cli, config: &Config) -> Result<()> {
             Some(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
             None => value,
         };
-        let width = dims.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let height = dims.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let width = dims
+            .get("width")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let height = dims
+            .get("height")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
         if cli.json {
             println!(
@@ -2993,8 +3110,8 @@ async fn viewport(cli: &Cli, config: &Config) -> Result<()> {
 }
 
 async fn cookies(cli: &Cli, config: &Config, command: &Option<CookiesCommands>) -> Result<()> {
-    if is_extension_mode(cli, config) {
-        return cookies_extension(cli, config, command).await;
+    if cli.extension {
+        return cookies_extension(cli, command).await;
     }
 
     let session_manager = create_session_manager(cli, config);
@@ -3090,14 +3207,11 @@ async fn cookies(cli: &Cli, config: &Config, command: &Option<CookiesCommands>) 
                 println!("{} Cookie deleted: {}", "✓".green(), name);
             }
         }
-        Some(CookiesCommands::Clear {
-            domain, dry_run, ..
-        }) => {
+        Some(CookiesCommands::Clear { domain, dry_run, .. }) => {
             if domain.is_some() || *dry_run {
                 return Err(ActionbookError::Other(
                     "--domain and --dry-run are only supported in extension mode (--extension). \
-                     In CDP mode, 'cookies clear' clears all cookies for the session."
-                        .to_string(),
+                     In CDP mode, 'cookies clear' clears all cookies for the session.".to_string()
                 ));
             }
 
@@ -3116,15 +3230,11 @@ async fn cookies(cli: &Cli, config: &Config, command: &Option<CookiesCommands>) 
     Ok(())
 }
 
-async fn cookies_extension(
-    cli: &Cli,
-    config: &Config,
-    command: &Option<CookiesCommands>,
-) -> Result<()> {
+async fn cookies_extension(cli: &Cli, command: &Option<CookiesCommands>) -> Result<()> {
     // Get current page URL for cookie operations.
     // chrome.cookies API requires a valid http(s) URL to scope all operations —
     // we never allow cross-domain wildcard reads/writes.
-    let current_url = extension_eval(cli, config, "window.location.href")
+    let current_url = extension_eval(cli, "window.location.href")
         .await
         .ok()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -3132,10 +3242,7 @@ async fn cookies_extension(
         .unwrap_or_default();
 
     /// Build a URL for cookie operations: explicit domain takes priority, fall back to current_url.
-    fn resolve_cookie_url(
-        current_url: &str,
-        domain: Option<&str>,
-    ) -> std::result::Result<String, ActionbookError> {
+    fn resolve_cookie_url(current_url: &str, domain: Option<&str>) -> std::result::Result<String, ActionbookError> {
         // Domain first: user explicitly asked for this domain
         if let Some(d) = domain {
             let clean = d.trim_start_matches('.');
@@ -3155,7 +3262,6 @@ async fn cookies_extension(
             let url = resolve_cookie_url(&current_url, None)?;
             let result = extension_send(
                 cli,
-                config,
                 "Extension.getCookies",
                 serde_json::json!({ "url": url }),
             )
@@ -3171,11 +3277,18 @@ async fn cookies_extension(
             } else if cookies.is_empty() {
                 println!("{} No cookies (extension)", "!".yellow());
             } else {
-                println!("{} {} cookies (extension)\n", "✓".green(), cookies.len());
+                println!(
+                    "{} {} cookies (extension)\n",
+                    "✓".green(),
+                    cookies.len()
+                );
                 for cookie in &cookies {
                     let name = cookie.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let value = cookie.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                    let domain = cookie.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+                    let domain = cookie
+                        .get("domain")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     println!(
                         "  {} = {} {}",
                         name.bold(),
@@ -3189,7 +3302,6 @@ async fn cookies_extension(
             let url = resolve_cookie_url(&current_url, None)?;
             let result = extension_send(
                 cli,
-                config,
                 "Extension.getCookies",
                 serde_json::json!({ "url": url }),
             )
@@ -3230,7 +3342,7 @@ async fn cookies_extension(
                 params["domain"] = serde_json::json!(d);
             }
 
-            extension_send(cli, config, "Extension.setCookie", params).await?;
+            extension_send(cli, "Extension.setCookie", params).await?;
 
             if cli.json {
                 println!(
@@ -3253,19 +3365,22 @@ async fn cookies_extension(
                 "url": url,
             });
 
-            extension_send(cli, config, "Extension.removeCookie", params).await?;
+            extension_send(cli, "Extension.removeCookie", params).await?;
 
             if cli.json {
-                println!("{}", serde_json::json!({ "success": true, "name": name }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "success": true, "name": name })
+                );
             } else {
-                println!("{} Cookie deleted: {} (extension)", "✓".green(), name);
+                println!(
+                    "{} Cookie deleted: {} (extension)",
+                    "✓".green(),
+                    name
+                );
             }
         }
-        Some(CookiesCommands::Clear {
-            domain,
-            dry_run,
-            yes,
-        }) => {
+        Some(CookiesCommands::Clear { domain, dry_run, yes }) => {
             let url = resolve_cookie_url(&current_url, domain.as_deref())?;
 
             // Fetch cookies to preview count.
@@ -3276,7 +3391,12 @@ async fn cookies_extension(
             if let Some(d) = domain.as_deref() {
                 get_params["domain"] = serde_json::json!(d.trim_start_matches('.'));
             }
-            let preview = extension_send(cli, config, "Extension.getCookies", get_params).await?;
+            let preview = extension_send(
+                cli,
+                "Extension.getCookies",
+                get_params,
+            )
+            .await?;
             let cookies = preview
                 .get("cookies")
                 .and_then(|c| c.as_array())
@@ -3355,7 +3475,12 @@ async fn cookies_extension(
             if let Some(d) = domain.as_deref() {
                 clear_params["domain"] = serde_json::json!(d.trim_start_matches('.'));
             }
-            extension_send(cli, config, "Extension.clearCookies", clear_params).await?;
+            extension_send(
+                cli,
+                "Extension.clearCookies",
+                clear_params,
+            )
+            .await?;
 
             if cli.json {
                 println!(
@@ -3452,8 +3577,8 @@ async fn scroll(
     };
 
     // Execute scroll command
-    if is_extension_mode(cli, config) {
-        extension_eval(cli, config, &js).await?;
+    if cli.extension {
+        extension_eval(cli, &js).await?;
     } else {
         let session_manager = create_session_manager(cli, config);
         session_manager
@@ -3485,35 +3610,470 @@ async fn scroll(
     Ok(())
 }
 
-async fn close(cli: &Cli, config: &Config) -> Result<()> {
-    if is_extension_mode(cli, config) {
-        let port = resolve_extension_port(cli, config);
+/// Resolve session tag: use CLI value, env var, or auto-generate.
+fn resolve_session_tag(cli: &Cli) -> String {
+    cli.session_tag.clone().unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("ab-{}", ts)
+    })
+}
 
-        // Best-effort tab detach. If extension is not connected, continue closing bridge.
-        if extension_bridge::is_bridge_running(port).await {
-            match extension_bridge::send_command(port, "Extension.detachTab", serde_json::json!({}))
-                .await
-            {
-                Ok(_) => tracing::debug!("Extension tab detached"),
-                Err(e) => tracing::debug!("Extension detach skipped (non-fatal): {}", e),
+/// One-shot content fetching: navigate → wait → extract → close.
+///
+/// Combines I2 (HTTP degradation), I3 (session tags), I4 (URL rewriting),
+/// and I5 (domain-aware wait hints) into a single high-level command.
+async fn fetch(
+    cli: &Cli,
+    config: &Config,
+    url: &str,
+    format: &str,
+    max_tokens: Option<usize>,
+    timeout_ms: u64,
+    lite: bool,
+) -> Result<()> {
+    // Extension mode not supported for one-shot fetch
+    if cli.extension {
+        return Err(ActionbookError::FeatureNotSupported(
+            "browser fetch is not supported in extension mode. Use browser open + snapshot instead."
+                .to_string(),
+        ));
+    }
+
+    let session_tag = resolve_session_tag(cli);
+    tracing::info!("[{}] fetch starting: {}", session_tag, url);
+
+    // I4: URL rewriting
+    let normalized_url = normalize_navigation_url(url)?;
+    let normalized_url = if cli.rewrite_urls {
+        let (rewritten, was_rewritten) =
+            crate::browser::url_rewrite::maybe_rewrite(&normalized_url);
+        if was_rewritten {
+            tracing::info!(
+                "[{}] URL rewritten: {} -> {}",
+                session_tag,
+                normalized_url,
+                rewritten
+            );
+        }
+        rewritten
+    } else {
+        normalized_url
+    };
+
+    // I2: HTTP-first fetch for --lite mode (skip for snapshot format which needs a11y tree)
+    if lite && format != "snapshot" {
+        tracing::info!("[{}] trying HTTP fetch (lite mode)", session_tag);
+        match crate::browser::http_fetch::try_http_fetch(
+            &normalized_url,
+            max_tokens,
+            Some(&session_tag),
+        )
+        .await
+        {
+            Ok(Some(result)) => {
+                tracing::info!(
+                    "[{}] HTTP fetch succeeded ({} tokens)",
+                    session_tag,
+                    result.tokens_estimate
+                );
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "content": result.content,
+                            "format": result.format,
+                            "url": result.url,
+                            "tokensEstimate": result.tokens_estimate,
+                            "truncated": result.truncated,
+                            "sessionTag": session_tag,
+                            "method": "http",
+                        })
+                    );
+                } else {
+                    println!("{}", result.content);
+                }
+                return Ok(());
+            }
+            Ok(None) => {
+                tracing::info!("[{}] HTTP fetch returned empty/SPA, falling back to browser", session_tag);
+            }
+            Err(e) => {
+                tracing::warn!("[{}] HTTP fetch error, falling back to browser: {}", session_tag, e);
             }
         }
+    }
 
-        // Always stop bridge on close in extension mode.
-        bridge_lifecycle::stop_bridge(port).await?;
+    // Browser-based fetch path
+    let fetch_result = timeout(
+        Duration::from_millis(timeout_ms),
+        fetch_via_browser(cli, config, &normalized_url, format, max_tokens, &session_tag),
+    )
+    .await;
+
+    match fetch_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(ActionbookError::Timeout(format!(
+            "Fetch timed out after {}ms: {}",
+            timeout_ms, normalized_url
+        ))),
+    }
+}
+
+/// Browser-based fetch implementation (used by `fetch()` after HTTP fallback).
+async fn fetch_via_browser(
+    cli: &Cli,
+    config: &Config,
+    url: &str,
+    format: &str,
+    max_tokens: Option<usize>,
+    session_tag: &str,
+) -> Result<()> {
+    // Create a temporary config with headless forced on
+    let mut fetch_config = config.clone();
+    let profile_name = format!("__fetch_{}__", std::process::id());
+
+    // Set up a temporary profile with headless mode
+    let mut profile = fetch_config.get_profile("actionbook").unwrap_or_default();
+    profile.headless = true;
+    if let Some(ref path) = cli.browser_path {
+        profile.browser_path = Some(path.clone());
+    }
+    fetch_config.set_profile(&profile_name, profile);
+    fetch_config.browser.default_profile = profile_name.clone();
+
+    // Create driver with temporary profile
+    let temp_cli = Cli {
+        browser_path: cli.browser_path.clone(),
+        cdp: cli.cdp.clone(),
+        profile: Some(profile_name.clone()),
+        headless: true,
+        stealth: cli.stealth,
+        stealth_os: cli.stealth_os.clone(),
+        stealth_gpu: cli.stealth_gpu.clone(),
+        api_key: cli.api_key.clone(),
+        json: cli.json,
+        browser_mode: None, // Use default mode
+        extension: false,
+        extension_port: cli.extension_port,
+        verbose: cli.verbose,
+        block_images: cli.block_images,
+        block_media: cli.block_media,
+        no_animations: true, // Always disable animations for fetch
+        auto_dismiss_dialogs: true, // Always auto-dismiss for fetch
+        session_tag: cli.session_tag.clone(),
+        rewrite_urls: false, // Already rewritten above
+        wait_hint: cli.wait_hint.clone(),
+        camofox: cli.camofox,
+        camofox_port: cli.camofox_port,
+        command: crate::cli::Commands::Browser {
+            command: BrowserCommands::Status,
+        },
+    };
+
+    let mut driver = create_browser_driver(&temp_cli, &fetch_config).await?;
+
+    // Apply resource blocking
+    apply_resource_blocking(&temp_cli, &mut driver).await;
+
+    // Apply animation disabling
+    if let Err(e) = driver.disable_animations().await {
+        tracing::warn!("[{}] Failed to disable animations: {}", session_tag, e);
+    }
+
+    // Apply dialog auto-dismissal
+    if let Err(e) = driver.enable_dialog_auto_dismiss().await {
+        tracing::warn!("[{}] Failed to enable dialog auto-dismiss: {}", session_tag, e);
+    }
+
+    // Navigate
+    tracing::info!("[{}] navigating to {}", session_tag, url);
+    driver.goto(url).await?;
+
+    // I5: Domain-aware wait
+    let wait_ms =
+        crate::browser::wait_hints::resolve_wait_ms(url, cli.wait_hint.as_deref());
+    if wait_ms > 0 {
+        tracing::info!("[{}] waiting {}ms (domain hint)", session_tag, wait_ms);
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    }
+
+    // Also wait for network idle
+    if let Err(e) = driver.wait_for_network_idle(15_000, 500).await {
+        tracing::debug!("[{}] network idle wait ended: {}", session_tag, e);
+    }
+
+    // Extract content based on format
+    let (content, content_format, tokens_estimate, truncated) = match format {
+        "snapshot" => {
+            let raw = driver.get_accessibility_tree_raw().await?;
+            let (nodes, _cache) = crate::browser::snapshot::parse_ax_tree(
+                &raw,
+                crate::browser::snapshot::SnapshotFilter::All,
+                None,
+                None,
+            );
+
+            let (final_nodes, was_truncated) = if let Some(max) = max_tokens {
+                crate::browser::snapshot::truncate_to_tokens(
+                    &nodes,
+                    max,
+                    crate::browser::snapshot::SnapshotFormat::Compact,
+                )
+            } else {
+                (nodes, false)
+            };
+
+            let output = crate::browser::snapshot::format_compact(&final_nodes);
+            let est = output.len() / 4;
+            (output, "snapshot", est, was_truncated)
+        }
+        "html" => {
+            let html = driver.get_content().await?;
+            let est = html.len() / 4;
+            let (content, truncated) = if let Some(max) = max_tokens {
+                if est > max {
+                    let char_limit = max * 4;
+                    let end = if html.len() > char_limit {
+                        html[..char_limit]
+                            .rfind(char::is_whitespace)
+                            .unwrap_or(char_limit)
+                    } else {
+                        html.len()
+                    };
+                    (html[..end].to_string(), true)
+                } else {
+                    (html, false)
+                }
+            } else {
+                (html, false)
+            };
+            let final_est = content.len() / 4;
+            (content, "html", final_est, truncated)
+        }
+        _ => {
+            // "text" (default) — use readability
+            let text = driver
+                .get_readable_text(crate::browser::TextExtractionMode::Readability)
+                .await?;
+            let est = text.len() / 4;
+            let (content, truncated) = if let Some(max) = max_tokens {
+                if est > max {
+                    let char_limit = max * 4;
+                    let end = if text.len() > char_limit {
+                        text[..char_limit]
+                            .rfind(char::is_whitespace)
+                            .unwrap_or(char_limit)
+                    } else {
+                        text.len()
+                    };
+                    (text[..end].to_string(), true)
+                } else {
+                    (text, false)
+                }
+            } else {
+                (text, false)
+            };
+            let final_est = content.len() / 4;
+            (content, "text", final_est, truncated)
+        }
+    };
+
+    tracing::info!(
+        "[{}] extracted {} tokens ({} format)",
+        session_tag,
+        tokens_estimate,
+        content_format
+    );
+
+    // Output
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "content": content,
+                "format": content_format,
+                "url": url,
+                "tokensEstimate": tokens_estimate,
+                "truncated": truncated,
+                "sessionTag": session_tag,
+                "method": "browser",
+            })
+        );
+    } else {
+        println!("{}", content);
+    }
+
+    // Clean up: close the session
+    let session_manager = create_session_manager(&temp_cli, &fetch_config);
+    if let Err(e) = session_manager.close_session(Some(&profile_name)).await {
+        tracing::debug!("[{}] cleanup: {}", session_tag, e);
+    }
+
+    // Clean up temporary profile directory
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("actionbook");
+    let session_file = data_dir.join("sessions").join(format!("{}.json", profile_name));
+    let _ = std::fs::remove_file(&session_file);
+    let profile_dir = data_dir.join("profiles").join(&profile_name);
+    let _ = std::fs::remove_dir_all(&profile_dir);
+
+    Ok(())
+}
+
+async fn upload(
+    cli: &Cli,
+    config: &Config,
+    files: &[String],
+    selector: Option<&str>,
+    ref_id: Option<&str>,
+    wait_ms: u64,
+) -> Result<()> {
+    // 1. Validate all files exist and resolve to absolute paths
+    let mut abs_paths = Vec::with_capacity(files.len());
+    for f in files {
+        let path = std::path::Path::new(f);
+        if !path.exists() {
+            return Err(ActionbookError::Other(format!("File not found: {}", f)));
+        }
+        let canonical = std::fs::canonicalize(path).map_err(|e| {
+            ActionbookError::Other(format!("Cannot resolve path {}: {}", f, e))
+        })?;
+        abs_paths.push(canonical.to_string_lossy().to_string());
+    }
+
+    // 2. Extension mode: JS fallback (cannot set files programmatically, just click the input)
+    if cli.extension {
+        let sel = selector.unwrap_or("input[type=\"file\"]");
+        let resolve_js = js_resolve_selector(sel);
+        let click_js = format!(
+            r#"(function() {{
+                var el = {};
+                if (!el) return {{ success: false, error: 'File input not found' }};
+                el.click();
+                return {{ success: true, note: 'Triggered native file dialog — extension mode cannot set files programmatically' }};
+            }})()"#,
+            resolve_js
+        );
+        let result = extension_eval(cli, &click_js).await?;
+        if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            let err = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("File input not found");
+            return Err(ActionbookError::ElementNotFound(err.to_string()));
+        }
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": true,
+                    "selector": sel,
+                    "note": "Extension mode: opened native file dialog. Cannot set files programmatically."
+                })
+            );
+        } else {
+            println!(
+                "{} Opened file dialog for: {} (extension mode — select files manually)",
+                "⚠".yellow(),
+                sel
+            );
+        }
+        return Ok(());
+    }
+
+    // 3. CDP mode
+    let mut driver = create_browser_driver(cli, config).await?;
+    apply_resource_blocking(cli, &mut driver).await;
+
+    // --ref mode
+    if let Some(ref_str) = ref_id {
+        let backend_node_id = resolve_snapshot_ref(&mut driver, ref_str).await?;
+
+        driver
+            .set_file_input_files_by_node_id(backend_node_id, &abs_paths)
+            .await?;
+
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": true,
+                    "ref": ref_str,
+                    "backendNodeId": backend_node_id,
+                    "files": abs_paths,
+                })
+            );
+        } else {
+            println!(
+                "{} Uploaded {} file(s) via ref={} (nodeId={})",
+                "✓".green(),
+                abs_paths.len(),
+                ref_str,
+                backend_node_id,
+            );
+        }
+        return Ok(());
+    }
+
+    // Selector mode (auto-detect if omitted)
+    let sel = selector.unwrap_or("input[type=\"file\"]");
+
+    // Optional wait for element
+    if wait_ms > 0 {
+        if let Some(mgr) = driver.as_cdp_mut() {
+            mgr.wait_for_element(None, sel, wait_ms).await?;
+        }
+    }
+
+    driver.set_file_input_files(sel, &abs_paths).await?;
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "selector": sel,
+                "files": abs_paths,
+            })
+        );
+    } else {
+        println!(
+            "{} Uploaded {} file(s) to: {}",
+            "✓".green(),
+            abs_paths.len(),
+            sel,
+        );
+    }
+
+    Ok(())
+}
+
+async fn close(cli: &Cli, config: &Config) -> Result<()> {
+    if cli.extension {
+        extension_send(cli, "Extension.detachTab", serde_json::json!({})).await?;
 
         if cli.json {
             println!("{}", serde_json::json!({ "success": true }));
         } else {
-            println!("{} Browser closed (extension)", "✓".green());
+            println!("{} Tab detached (extension)", "✓".green());
         }
         return Ok(());
     }
 
     let session_manager = create_session_manager(cli, config);
+    let profile_name = effective_profile_name(cli, config);
     session_manager
-        .close_session(effective_profile_arg(cli, config))
+        .close_session(Some(profile_name))
         .await?;
+
+    // G3: Mark clean exit to prevent "Chrome didn't shut down correctly" on next launch
+    let profile_dir = crate::browser::launcher::BrowserLauncher::default_user_data_dir(profile_name);
+    crate::browser::launcher::mark_clean_exit(&profile_dir);
 
     if cli.json {
         println!(
@@ -3529,10 +4089,507 @@ async fn close(cli: &Cli, config: &Config) -> Result<()> {
     Ok(())
 }
 
+async fn fingerprint(cli: &Cli, config: &Config, command: &FingerprintCommands) -> Result<()> {
+    match command {
+        FingerprintCommands::Rotate { os, screen } => {
+            use crate::browser::fingerprint_generator::{
+                FingerprintGenerator, OperatingSystem, generate_with_os,
+            };
+
+            // Generate fingerprint
+            let fingerprint = match os.to_lowercase().as_str() {
+                "windows" => generate_with_os(OperatingSystem::Windows),
+                "mac" | "macos" => generate_with_os(OperatingSystem::MacOsArm),
+                "linux" => generate_with_os(OperatingSystem::Linux),
+                _ => {
+                    let mut gen = FingerprintGenerator::new();
+                    gen.generate()
+                }
+            };
+
+            // Override screen if specified
+            let mut fp = fingerprint;
+            if screen != "random" {
+                if let Some((w, h)) = screen.split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                        fp.screen_width = w;
+                        fp.screen_height = h;
+                        fp.avail_width = w;
+                        fp.avail_height = h.saturating_sub(40); // taskbar offset
+                    }
+                }
+            }
+
+            let mut driver = create_browser_driver(cli, config).await?;
+            driver.rotate_fingerprint(&fp).await?;
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "userAgent": fp.user_agent,
+                        "platform": fp.platform,
+                        "screen": format!("{}x{}", fp.screen_width, fp.screen_height),
+                        "hardwareConcurrency": fp.hardware_concurrency,
+                        "deviceMemory": fp.device_memory,
+                    })
+                );
+            } else {
+                println!("{} Fingerprint rotated", "✓".green());
+                println!("  UA: {}", fp.user_agent);
+                println!("  Platform: {}", fp.platform);
+                println!(
+                    "  Screen: {}x{}",
+                    fp.screen_width, fp.screen_height
+                );
+                println!("  CPU cores: {}", fp.hardware_concurrency);
+                println!("  Device memory: {} GB", fp.device_memory);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ========== H1: Console Log Capture ==========
+
+async fn console_log(cli: &Cli, config: &Config, duration_ms: u64, level: &str) -> Result<()> {
+    if cli.extension {
+        return Err(ActionbookError::FeatureNotSupported(
+            "Console capture is not supported in extension mode".to_string(),
+        ));
+    }
+
+    let mut driver = create_browser_driver(cli, config).await?;
+
+    // Install interceptor
+    driver.install_console_interceptor().await?;
+
+    if duration_ms > 0 {
+        // Listen for specified duration
+        tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+    }
+
+    let logs = driver.capture_console_logs().await?;
+
+    // Filter by level
+    let filtered: Vec<&serde_json::Value> = if level == "all" {
+        logs.iter().collect()
+    } else {
+        logs.iter()
+            .filter(|l| l.get("level").and_then(|v| v.as_str()) == Some(level))
+            .collect()
+    };
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&filtered)?);
+    } else {
+        if filtered.is_empty() {
+            println!(
+                "{} No console messages captured{}",
+                "ℹ".blue(),
+                if duration_ms > 0 {
+                    format!(" (listened for {}ms)", duration_ms)
+                } else {
+                    String::new()
+                }
+            );
+        } else {
+            for entry in &filtered {
+                let lvl = entry.get("level").and_then(|v| v.as_str()).unwrap_or("log");
+                let text = entry.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let prefix = match lvl {
+                    "error" => format!("[{}]", "ERR".red()),
+                    "warn" => format!("[{}]", "WRN".yellow()),
+                    "info" => format!("[{}]", "INF".blue()),
+                    "debug" => format!("[{}]", "DBG".dimmed()),
+                    _ => format!("[{}]", "LOG".normal()),
+                };
+                println!("{} {}", prefix, text);
+            }
+            println!(
+                "\n{} {} message(s) captured",
+                "✓".green(),
+                filtered.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+// ========== H2: Network Idle Wait ==========
+
+async fn wait_idle(cli: &Cli, config: &Config, timeout_ms: u64, idle_ms: u64) -> Result<()> {
+    if cli.extension {
+        return Err(ActionbookError::FeatureNotSupported(
+            "Network idle wait is not supported in extension mode".to_string(),
+        ));
+    }
+
+    let mut driver = create_browser_driver(cli, config).await?;
+    driver.wait_for_network_idle(timeout_ms, idle_ms).await?;
+
+    if cli.json {
+        println!("{}", serde_json::json!({ "success": true, "idle": true }));
+    } else {
+        println!("{} Network is idle", "✓".green());
+    }
+    Ok(())
+}
+
+// ========== H4: Element Info ==========
+
+async fn info(cli: &Cli, config: &Config, selector: &str) -> Result<()> {
+    if cli.extension {
+        let js = format!(
+            r#"(function() {{
+                var el = document.querySelector('{}');
+                if (!el) return null;
+                var rect = el.getBoundingClientRect();
+                var cs = getComputedStyle(el);
+                return {{
+                    tagName: el.tagName.toLowerCase(),
+                    id: el.id || null,
+                    textContent: (el.textContent || '').trim().substring(0, 200),
+                    boundingBox: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }},
+                    isVisible: rect.width > 0 && rect.height > 0 && cs.visibility !== 'hidden'
+                }};
+            }})()"#,
+            escape_js_string(selector)
+        );
+        let result = extension_eval(cli, &js).await?;
+        if result.is_null() {
+            return Err(ActionbookError::ElementNotFound(selector.to_string()));
+        }
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let mut driver = create_browser_driver(cli, config).await?;
+    let result = driver.get_element_info(selector).await?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        let tag = result.get("tagName").and_then(|v| v.as_str()).unwrap_or("?");
+        let id = result.get("id").and_then(|v| v.as_str());
+        let text = result.get("textContent").and_then(|v| v.as_str()).unwrap_or("");
+        let visible = result.get("isVisible").and_then(|v| v.as_bool()).unwrap_or(false);
+        let interactive = result.get("isInteractive").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        println!("{} <{}>", "Element:".bold(), tag);
+        if let Some(id) = id {
+            if !id.is_empty() {
+                println!("  id: {}", id);
+            }
+        }
+        if !text.is_empty() {
+            let display = if text.len() > 80 { &text[..80] } else { text };
+            println!("  text: \"{}\"", display);
+        }
+        if let Some(bbox) = result.get("boundingBox") {
+            let x = bbox.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = bbox.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let w = bbox.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let h = bbox.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            println!("  bbox: ({:.0}, {:.0}) {}x{}", x, y, w as u32, h as u32);
+        }
+        println!(
+            "  visible: {} | interactive: {}",
+            if visible { "yes".green().to_string() } else { "no".red().to_string() },
+            if interactive { "yes".green().to_string() } else { "no".dimmed().to_string() }
+        );
+        if let Some(selectors) = result.get("suggestedSelectors").and_then(|v| v.as_array()) {
+            if !selectors.is_empty() {
+                println!("  selectors:");
+                for s in selectors {
+                    if let Some(sel) = s.as_str() {
+                        println!("    {}", sel);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ========== H5: Local Storage Management ==========
+
+async fn storage(cli: &Cli, config: &Config, command: &StorageCommands) -> Result<()> {
+    match command {
+        StorageCommands::Get { key, session } => {
+            let storage_type = if *session { "sessionStorage" } else { "localStorage" };
+            let js = format!(
+                "(function() {{ var v = {}.getItem('{}'); return v; }})()",
+                storage_type,
+                escape_js_string(key)
+            );
+
+            let result = if cli.extension {
+                extension_eval(cli, &js).await?
+            } else {
+                let mut driver = create_browser_driver(cli, config).await?;
+                let r = driver.eval(&js).await?;
+                serde_json::from_str(&r).unwrap_or(serde_json::Value::Null)
+            };
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "key": key, "value": result, "storage": storage_type })
+                );
+            } else if result.is_null() {
+                println!("{} Key '{}' not found in {}", "ℹ".blue(), key, storage_type);
+            } else {
+                println!("{}", result.as_str().unwrap_or(&result.to_string()));
+            }
+        }
+        StorageCommands::Set { key, value, session } => {
+            let storage_type = if *session { "sessionStorage" } else { "localStorage" };
+            let js = format!(
+                "{}.setItem('{}', '{}')",
+                storage_type,
+                escape_js_string(key),
+                escape_js_string(value)
+            );
+
+            if cli.extension {
+                extension_eval(cli, &js).await?;
+            } else {
+                let mut driver = create_browser_driver(cli, config).await?;
+                driver.eval(&js).await?;
+            };
+
+            if cli.json {
+                println!("{}", serde_json::json!({ "success": true }));
+            } else {
+                println!("{} Set {}['{}']", "✓".green(), storage_type, key);
+            }
+        }
+        StorageCommands::Remove { key, session } => {
+            let storage_type = if *session { "sessionStorage" } else { "localStorage" };
+            let js = format!(
+                "{}.removeItem('{}')",
+                storage_type,
+                escape_js_string(key)
+            );
+
+            if cli.extension {
+                extension_eval(cli, &js).await?;
+            } else {
+                let mut driver = create_browser_driver(cli, config).await?;
+                driver.eval(&js).await?;
+            };
+
+            if cli.json {
+                println!("{}", serde_json::json!({ "success": true }));
+            } else {
+                println!("{} Removed '{}' from {}", "✓".green(), key, storage_type);
+            }
+        }
+        StorageCommands::Clear { session } => {
+            let storage_type = if *session { "sessionStorage" } else { "localStorage" };
+            let js = format!("{}.clear()", storage_type);
+
+            if cli.extension {
+                extension_eval(cli, &js).await?;
+            } else {
+                let mut driver = create_browser_driver(cli, config).await?;
+                driver.eval(&js).await?;
+            };
+
+            if cli.json {
+                println!("{}", serde_json::json!({ "success": true }));
+            } else {
+                println!("{} Cleared {}", "✓".green(), storage_type);
+            }
+        }
+        StorageCommands::List { session } => {
+            let storage_type = if *session { "sessionStorage" } else { "localStorage" };
+            let js = format!(
+                "(function() {{ var s = {}; var keys = []; for (var i = 0; i < s.length; i++) {{ var k = s.key(i); keys.push({{ key: k, value: s.getItem(k) }}); }} return keys; }})()",
+                storage_type
+            );
+
+            let result = if cli.extension {
+                extension_eval(cli, &js).await?
+            } else {
+                let mut driver = create_browser_driver(cli, config).await?;
+                let r = driver.eval(&js).await?;
+                serde_json::from_str(&r).unwrap_or(serde_json::Value::Null)
+            };
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let empty = vec![];
+                let items = result.as_array().unwrap_or(&empty);
+                if items.is_empty() {
+                    println!("{} {} is empty", "ℹ".blue(), storage_type);
+                } else {
+                    println!("{} ({} keys):", storage_type, items.len());
+                    for item in items {
+                        let k = item.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+                        let v = item.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                        let display = if v.len() > 60 { &v[..60] } else { v };
+                        println!("  {} = {}", k.bold(), display);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ========== H6: Device Emulation ==========
+
+/// Device presets for emulation
+fn resolve_device(name: &str) -> Result<(u32, u32, f64, bool, Option<&'static str>)> {
+    // (width, height, scale, mobile, user_agent)
+    match name.to_lowercase().as_str() {
+        "iphone-14" | "iphone14" => Ok((
+            390, 844, 3.0, true,
+            Some("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"),
+        )),
+        "iphone-se" | "iphonese" => Ok((
+            375, 667, 2.0, true,
+            Some("Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"),
+        )),
+        "pixel-7" | "pixel7" => Ok((
+            412, 915, 2.625, true,
+            Some("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"),
+        )),
+        "ipad" | "ipad-air" => Ok((
+            820, 1180, 2.0, true,
+            Some("Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"),
+        )),
+        "desktop-hd" | "1080p" => Ok((1920, 1080, 1.0, false, None)),
+        "desktop-4k" | "4k" => Ok((3840, 2160, 2.0, false, None)),
+        _ => {
+            // Try to parse WxH format (e.g., "1280x720")
+            let parts: Vec<&str> = name.split('x').collect();
+            if parts.len() == 2 {
+                let w = parts[0].parse::<u32>().map_err(|_| {
+                    ActionbookError::Other(format!("Invalid width in '{}'", name))
+                })?;
+                let h = parts[1].parse::<u32>().map_err(|_| {
+                    ActionbookError::Other(format!("Invalid height in '{}'", name))
+                })?;
+                Ok((w, h, 1.0, false, None))
+            } else {
+                Err(ActionbookError::Other(format!(
+                    "Unknown device '{}'. Available: iphone-14, iphone-se, pixel-7, ipad, desktop-hd, desktop-4k, or WxH (e.g., 1280x720)",
+                    name
+                )))
+            }
+        }
+    }
+}
+
+async fn emulate(cli: &Cli, config: &Config, device: &str) -> Result<()> {
+    let (width, height, scale, mobile, ua) = resolve_device(device)?;
+
+    if cli.extension {
+        return Err(ActionbookError::FeatureNotSupported(
+            "Device emulation is not supported in extension mode".to_string(),
+        ));
+    }
+
+    let mut driver = create_browser_driver(cli, config).await?;
+    driver
+        .emulate_device(width, height, scale, mobile, ua)
+        .await?;
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "device": device,
+                "width": width,
+                "height": height,
+                "scale": scale,
+                "mobile": mobile
+            })
+        );
+    } else {
+        println!(
+            "{} Emulating {} ({}x{} @{}x{})",
+            "✓".green(),
+            device,
+            width,
+            height,
+            scale,
+            if mobile { " mobile" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+// ========== H7: Wait for JS Condition ==========
+
+async fn wait_fn(
+    cli: &Cli,
+    config: &Config,
+    expression: &str,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<()> {
+    if cli.extension {
+        // Extension mode: poll via extension_eval
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        loop {
+            let result = extension_eval(cli, expression).await?;
+            let truthy = match &result {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+                serde_json::Value::String(s) => !s.is_empty(),
+                serde_json::Value::Null => false,
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Object(_) => true,
+            };
+            if truthy {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "success": true, "value": result })
+                    );
+                } else {
+                    println!("{} Expression returned truthy", "✓".green());
+                }
+                return Ok(());
+            }
+            if start.elapsed() > timeout {
+                return Err(ActionbookError::Timeout(format!(
+                    "Expression did not become truthy within {}ms",
+                    timeout_ms
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        }
+    }
+
+    let mut driver = create_browser_driver(cli, config).await?;
+    let result = driver
+        .wait_for_function(expression, timeout_ms, interval_ms)
+        .await?;
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({ "success": true, "value": result })
+        );
+    } else {
+        println!("{} Expression returned truthy", "✓".green());
+    }
+    Ok(())
+}
+
 async fn restart(cli: &Cli, config: &Config) -> Result<()> {
-    if is_extension_mode(cli, config) {
+    if cli.extension {
         // In extension mode, reload the page as a "restart"
-        extension_send(cli, config, "Page.reload", serde_json::json!({})).await?;
+        extension_send(cli, "Page.reload", serde_json::json!({})).await?;
 
         if cli.json {
             println!("{}", serde_json::json!({ "success": true }));
@@ -3597,11 +4654,9 @@ async fn connect(cli: &Cli, config: &Config, endpoint: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_profile_name, is_extension_mode, is_reusable_initial_blank_page_url,
-        normalize_navigation_url, render_snapshot_tree, resolve_extension_port,
-        should_prepare_extension_runtime,
+        effective_profile_name, is_reusable_initial_blank_page_url, normalize_navigation_url,
     };
-    use crate::cli::{BrowserCommands, BrowserMode, Cli, Commands};
+    use crate::cli::{BrowserCommands, Cli, Commands};
     use crate::config::Config;
     use serde_json::json;
 
@@ -3620,75 +4675,17 @@ mod tests {
             extension: false,
             extension_port: 19222,
             verbose: false,
+            block_images: false,
+            block_media: false,
+            no_animations: false,
+            auto_dismiss_dialogs: false,
+            session_tag: None,
+            rewrite_urls: false,
+            wait_hint: None,
             camofox: false,
             camofox_port: None,
             command: Commands::Browser { command },
         }
-    }
-
-    #[test]
-    fn extension_mode_uses_config_by_default() {
-        let cli = test_cli(None, BrowserCommands::Status);
-        let mut config = Config::default();
-        config.browser.mode = BrowserMode::Extension;
-
-        assert!(is_extension_mode(&cli, &config));
-    }
-
-    #[test]
-    fn extension_mode_prefers_browser_mode_flag() {
-        let mut cli = test_cli(None, BrowserCommands::Status);
-        cli.browser_mode = Some(BrowserMode::Isolated);
-        cli.extension = true;
-
-        let mut config = Config::default();
-        config.browser.mode = BrowserMode::Extension;
-
-        assert!(!is_extension_mode(&cli, &config));
-    }
-
-    #[test]
-    fn extension_mode_uses_deprecated_extension_flag_when_no_browser_mode_flag() {
-        let mut cli = test_cli(None, BrowserCommands::Status);
-        cli.extension = true;
-
-        let mut config = Config::default();
-        config.browser.mode = BrowserMode::Isolated;
-
-        assert!(is_extension_mode(&cli, &config));
-    }
-
-    #[test]
-    fn extension_port_is_fixed_when_config_overrides() {
-        let cli = test_cli(None, BrowserCommands::Status);
-        let mut config = Config::default();
-        config.browser.extension.port = 19223;
-
-        assert_eq!(resolve_extension_port(&cli, &config), 19222);
-    }
-
-    #[test]
-    fn extension_port_is_fixed_when_cli_overrides() {
-        let mut cli = test_cli(None, BrowserCommands::Status);
-        cli.extension_port = 19333;
-
-        let mut config = Config::default();
-        config.browser.extension.port = 19223;
-
-        assert_eq!(resolve_extension_port(&cli, &config), 19222);
-    }
-
-    #[test]
-    fn extension_runtime_prepare_for_open() {
-        assert!(should_prepare_extension_runtime(&BrowserCommands::Open {
-            url: "https://example.com".to_string()
-        }));
-    }
-
-    #[test]
-    fn extension_runtime_skip_prepare_for_status_and_close() {
-        assert!(!should_prepare_extension_runtime(&BrowserCommands::Status));
-        assert!(!should_prepare_extension_runtime(&BrowserCommands::Close));
     }
 
     #[test]
@@ -3827,277 +4824,6 @@ mod tests {
         assert_eq!(effective_profile_name(&cli, &config), "team-connect");
     }
 
-    #[test]
-    fn render_simple_button() {
-        let node = json!({
-            "role": "button",
-            "name": "Submit",
-            "ref": "e1"
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(output, "- button \"Submit\" [ref=e1]\n");
-    }
-
-    #[test]
-    fn render_heading_with_level() {
-        let node = json!({
-            "role": "heading",
-            "name": "Welcome",
-            "ref": "e1",
-            "level": 1
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(output, "- heading \"Welcome\" [ref=e1] [level=1]\n");
-    }
-
-    #[test]
-    fn render_checkbox_with_checked() {
-        let node = json!({
-            "role": "checkbox",
-            "name": "Accept terms",
-            "ref": "e1",
-            "checked": true
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(
-            output,
-            "- checkbox \"Accept terms\" [ref=e1] [checked=true]\n"
-        );
-    }
-
-    #[test]
-    fn render_textbox_with_value() {
-        let node = json!({
-            "role": "textbox",
-            "name": "Email",
-            "ref": "e1",
-            "value": "test@example.com"
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(
-            output,
-            "- textbox \"Email\" [ref=e1] [value=\"test@example.com\"]\n"
-        );
-    }
-
-    #[test]
-    fn render_empty_value_not_shown() {
-        let node = json!({
-            "role": "textbox",
-            "name": "Search",
-            "ref": "e1",
-            "value": ""
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(output, "- textbox \"Search\" [ref=e1]\n");
-    }
-
-    #[test]
-    fn render_text_node() {
-        let node = json!({
-            "role": "text",
-            "content": "Hello world"
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(output, "- text: Hello world\n");
-    }
-
-    #[test]
-    fn render_node_with_text_children() {
-        let node = json!({
-            "role": "generic",
-            "children": [
-                { "role": "text", "content": "Hello world" }
-            ]
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(output, "- generic:\n  - text: Hello world\n");
-    }
-
-    #[test]
-    fn render_nested_tree() {
-        let tree = json!({
-            "role": "navigation",
-            "children": [
-                {
-                    "role": "list",
-                    "children": [
-                        {
-                            "role": "listitem",
-                            "children": [
-                                { "role": "link", "name": "Home", "ref": "e1" }
-                            ]
-                        },
-                        {
-                            "role": "listitem",
-                            "children": [
-                                { "role": "link", "name": "About", "ref": "e2" }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        });
-        let output = render_snapshot_tree(&tree, 0);
-        let expected = "\
-- navigation:
-  - list:
-    - listitem:
-      - link \"Home\" [ref=e1]
-    - listitem:
-      - link \"About\" [ref=e2]
-";
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn render_respects_depth_indentation() {
-        let node = json!({
-            "role": "button",
-            "name": "Deep",
-            "ref": "e5"
-        });
-        let output = render_snapshot_tree(&node, 3);
-        assert_eq!(output, "      - button \"Deep\" [ref=e5]\n");
-    }
-
-    #[test]
-    fn render_no_ref_no_name() {
-        let node = json!({ "role": "generic" });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(output, "- generic\n");
-    }
-
-    #[test]
-    fn render_children_adds_colon() {
-        let node = json!({
-            "role": "form",
-            "children": [
-                { "role": "button", "name": "Go", "ref": "e1" }
-            ]
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert!(output.starts_with("- form:\n"));
-    }
-
-    #[test]
-    fn render_leaf_no_colon() {
-        let node = json!({
-            "role": "link",
-            "name": "Click me",
-            "ref": "e1"
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert!(!output.contains(':'));
-    }
-
-    #[test]
-    fn render_link_with_url() {
-        let node = json!({
-            "role": "link",
-            "ref": "e1",
-            "url": "https://example.com",
-            "children": [
-                { "role": "text", "content": "Example" }
-            ]
-        });
-        let output = render_snapshot_tree(&node, 0);
-        let expected = "\
-- link [ref=e1]:
-  - /url: https://example.com
-  - text: Example
-";
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn render_link_with_name_and_url() {
-        let node = json!({
-            "role": "link",
-            "name": "Home",
-            "ref": "e1",
-            "url": "https://example.com/home",
-            "children": [
-                { "role": "text", "content": "Home" }
-            ]
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert!(output.starts_with("- link \"Home\" [ref=e1]:"));
-        assert!(output.contains("- /url: https://example.com/home"));
-        assert!(output.contains("- text: Home"));
-    }
-
-    #[test]
-    fn render_inline_strong() {
-        let node = json!({
-            "role": "strong",
-            "children": [
-                { "role": "text", "content": "bold text" }
-            ]
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert_eq!(output, "- strong:\n  - text: bold text\n");
-    }
-
-    #[test]
-    fn render_url_adds_colon() {
-        let node = json!({
-            "role": "link",
-            "name": "Click",
-            "ref": "e1",
-            "url": "https://example.com"
-        });
-        let output = render_snapshot_tree(&node, 0);
-        assert!(output.contains("- link \"Click\" [ref=e1]:"));
-        assert!(output.contains("- /url: https://example.com"));
-    }
-
-    #[test]
-    fn render_realistic_page() {
-        let tree = json!({
-            "role": "generic",
-            "children": [
-                {
-                    "role": "banner",
-                    "children": [
-                        {
-                            "role": "navigation",
-                            "name": "Main",
-                            "ref": "e1",
-                            "children": [
-                                { "role": "link", "name": "Home", "ref": "e2" },
-                                { "role": "link", "name": "Products", "ref": "e3" }
-                            ]
-                        }
-                    ]
-                },
-                {
-                    "role": "main",
-                    "children": [
-                        { "role": "heading", "name": "Welcome", "ref": "e4", "level": 1 },
-                        {
-                            "role": "form",
-                            "children": [
-                                { "role": "textbox", "name": "Email", "ref": "e5", "value": "" },
-                                { "role": "button", "name": "Subscribe", "ref": "e6" }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        });
-        let output = render_snapshot_tree(&tree, 0);
-
-        // Verify key structural elements
-        assert!(output.contains("- navigation \"Main\" [ref=e1]:"));
-        assert!(output.contains("  - link \"Home\" [ref=e2]"));
-        assert!(output.contains("- heading \"Welcome\" [ref=e4] [level=1]"));
-        assert!(output.contains("- textbox \"Email\" [ref=e5]"));
-        assert!(output.contains("- button \"Subscribe\" [ref=e6]"));
-
-        // Verify nesting depth
-        let lines: Vec<&str> = output.lines().collect();
-        assert!(lines[0].starts_with("- generic:"));
-        assert!(lines[1].starts_with("  - banner:"));
-    }
+    // Tests for the new CDP Accessibility Tree snapshot formatting are in
+    // browser/snapshot.rs (format_compact, format_text, parse_ax_tree, diff_snapshots)
 }

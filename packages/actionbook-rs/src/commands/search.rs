@@ -30,15 +30,25 @@ pub async fn run(
 
     let result = client.search_actions(params).await?;
 
-    // Result is plain text, output directly
-    println!("{}", result);
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "query": query,
+                "results": result,
+            })
+        );
+    } else {
+        println!("{}", result);
 
-    // Print next step hint
-    println!(
-        "\n{} {}",
-        "Next step:".cyan(),
-        "actionbook get \"<area_id>\"".white()
-    );
+        // Print next step hint
+        println!(
+            "\n{} {}",
+            "Next step:".cyan(),
+            "actionbook get \"<area_id>\"".white()
+        );
+    }
 
     Ok(())
 }

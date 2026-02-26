@@ -87,7 +87,7 @@ pub async fn run(cli: &Cli, args: SetupArgs<'_>) -> Result<()> {
             print_step_connector();
             print_step_header(3, "Browser");
         }
-        browser_cfg::configure_browser(cli, &env, browser_flag, effective_non_interactive, &mut config).await?;
+        browser_cfg::configure_browser(cli, &env, browser_flag, effective_non_interactive, &mut config)?;
 
         // Step 4: Save configuration
         if !cli.json {

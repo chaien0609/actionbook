@@ -61,6 +61,9 @@ function generateHTML(json: ReportJSON, options: { title?: string } = {}): strin
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Prism.js for syntax highlighting -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css" id="prism-light" integrity="sha384-rCCjoCPCsizaAAYVoz1Q0CmCTvnctK0JkfCSjx7IIxexTBg+uCKtFYycedUjMyA2" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css" id="prism-dark" integrity="sha384-wFjoQjtV1y5jVHbt0p35Ui8aV8GVpEZkyF99OXWqP/eNJDU93D3Ugxkoyh6Y2I4A" crossorigin="anonymous" disabled>
   <style>
     :root {
       --color-primary: #3b82f6;
@@ -354,6 +357,30 @@ function generateHTML(json: ReportJSON, options: { title?: string } = {}): strin
       padding: 0.125rem 0.375rem;
       border-radius: 3px;
       font-size: 0.9em;
+    }
+    .prose pre,
+    .prose pre[class*="language-"] {
+      background: var(--color-bg-muted) !important;
+      padding: 1rem !important;
+      border-radius: 8px !important;
+      overflow-x: auto;
+      margin: 1rem 0 !important;
+      border: 1px solid var(--color-border);
+      white-space: pre-wrap !important;
+      word-break: break-word;
+    }
+    .prose pre code,
+    .prose code[class*="language-"] {
+      background: transparent !important;
+      padding: 0 !important;
+      border-radius: 0;
+      font-size: 0.875em;
+      line-height: 1.6;
+      display: block;
+      font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+      text-shadow: none !important;
+      white-space: pre-wrap !important;
+      word-break: break-word;
     }
     .prose strong { font-weight: 600; }
     .prose em { font-style: italic; }
@@ -1034,6 +1061,33 @@ function generateHTML(json: ReportJSON, options: { title?: string } = {}): strin
       border-radius: 6px;
       padding: 0.12rem 0.42rem;
       font-size: 0.86em;
+    }
+
+    .prose pre,
+    .prose pre[class*="language-"] {
+      background: var(--color-bg-muted) !important;
+      padding: 1rem !important;
+      border-radius: 8px !important;
+      overflow-x: auto;
+      margin: 1rem 0 !important;
+      border: 1px solid var(--color-border);
+      white-space: pre-wrap !important;
+      word-break: break-word;
+    }
+
+    .prose pre code,
+    .prose code[class*="language-"] {
+      background: transparent !important;
+      padding: 0 !important;
+      border-radius: 0;
+      border: none;
+      font-size: 0.875em;
+      line-height: 1.6;
+      display: block;
+      font-family: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+      text-shadow: none !important;
+      white-space: pre-wrap !important;
+      word-break: break-word;
     }
 
     .callout {
@@ -2246,6 +2300,42 @@ function generateHTML(json: ReportJSON, options: { title?: string } = {}): strin
     <span>Powered by</span>
     <strong>Actionbook</strong>
   </a>
+
+  <!-- Prism.js core and language support -->
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js" integrity="sha384-ZM8fDxYm+GXOWeJcxDetoRImNnEAS7XwVFH5kv0pT6RXNy92Nemw/Sj7NfciXpqg" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-rust.min.js" integrity="sha384-JyDgFjMbyrE/TGiEUSXW3CLjQOySrsoiUNAlXTFdIsr/XUfaB7E+eYlR+tGQ9bCO" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-javascript.min.js" integrity="sha384-D44bgYYKvaiDh4cOGlj1dbSDpSctn2FSUj118HZGmZEShZcO2v//Q5vvhNy206pp" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-typescript.min.js" integrity="sha384-PeOqKNW/piETaCg8rqKFy+Pm6KEk7e36/5YZE5XO/OaFdO+/Aw3O8qZ9qDPKVUgx" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js" integrity="sha384-WJdEkJKrbsqw0evQ4GB6mlsKe5cGTxBOw4KAEIa52ZLB7DDpliGkwdme/HMa5n1m" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js" integrity="sha384-9WmlN8ABpoFSSHvBGGjhvB3E/D8UkNB9HpLJjBQFC2VSQsM1odiQDv4NbEo+7l15" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-json.min.js" integrity="sha384-RhrmFFMb0ZCHImjFMpR/UE3VEtIVTCtNrtKQqXCzqXZNJala02N3UbVhi+qzw3CY" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-yaml.min.js" integrity="sha384-AKAiycghK0jDCjD+aavMHzDkLzRR7Yzcwh3+xL/295cvyVMe+cxQfyQC8xxGGcI8" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-toml.min.js" integrity="sha384-Uh6n44GRSQeQSMIIfAjlbqojWR7F5KALTHNsspuLDrNCsXpDPRdZbJ5A42AP/cA4" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-markdown.min.js" integrity="sha384-s888ApkYHxfPsp8n81g77Unl/0XYnYltLvWbwqKHcheRE8/dZPlT4IjW3mRGv/Hd" crossorigin="anonymous"></script>
+  <script>
+    // Apply syntax highlighting
+    Prism.highlightAll();
+
+    // Toggle Prism theme based on color scheme
+    function updatePrismTheme() {
+      const isDark = document.documentElement.getAttribute('data-theme') === 'dark' ||
+                     (document.documentElement.getAttribute('data-theme') === 'auto' &&
+                      window.matchMedia('(prefers-color-scheme: dark)').matches);
+
+      document.getElementById('prism-light').disabled = isDark;
+      document.getElementById('prism-dark').disabled = !isDark;
+    }
+
+    // Update on load
+    updatePrismTheme();
+
+    // Update on theme change
+    const observer = new MutationObserver(updatePrismTheme);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+    // Update on system theme change
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', updatePrismTheme);
+  </script>
 </body>
 </html>`;
 }
@@ -2488,8 +2578,13 @@ function hasBilingualContent(value: unknown): boolean {
 }
 
 function getRenderOptions(report: ReportJSON): RenderOptions {
+  // Check if user explicitly set showLanguageSwitcher in props
+  const userPreference = report.props?.showLanguageSwitcher;
+
   return {
-    showLanguageSwitcher: hasBilingualContent(report),
+    showLanguageSwitcher: userPreference !== undefined
+      ? userPreference
+      : hasBilingualContent(report),
   };
 }
 
@@ -2709,12 +2804,31 @@ function renderNode(node: ReportJSON, options: RenderOptions = { showLanguageSwi
     case 'Prose': {
       // Simple markdown-like rendering
       function renderMarkdown(raw: string): string {
-        let content = escapeHtml(raw);
+        let content = raw;
+
+        // Handle code blocks first (before escaping HTML)
+        const codeBlocks: string[] = [];
+        content = content.replace(/```(\w+)?\n([\s\S]*?)```/g, (match, lang, code) => {
+          const placeholder = `__CODEBLOCK_${codeBlocks.length}__`;
+          codeBlocks.push(`<pre><code class="language-${lang || 'text'}">${escapeHtml(code.trim())}</code></pre>`);
+          return placeholder;
+        });
+
+        // Now escape remaining HTML
+        content = escapeHtml(content);
+
+        // Restore code blocks
+        codeBlocks.forEach((block, i) => {
+          content = content.replace(`__CODEBLOCK_${i}__`, block);
+        });
+
+        // Other markdown formatting
         content = content.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
         content = content.replace(/\*([^*]+)\*/g, '<em>$1</em>');
         content = content.replace(/`([^`]+)`/g, '<code>$1</code>');
         content = content.replace(/^### (.+)$/gm, '<h4>$1</h4>');
         content = content.replace(/^## (.+)$/gm, '<h3>$1</h3>');
+        content = content.replace(/^# (.+)$/gm, '<h2>$1</h2>');
         content = content.replace(/\n\n/g, '</p><p>');
         content = content.replace(/^- (.+)$/gm, '<li>$1</li>');
         content = content.replace(/(<li>.*<\/li>)+/gs, '<ul>$&</ul>');

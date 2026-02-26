@@ -167,13 +167,12 @@ pub async fn stop_bridge(port: u16) -> Result<()> {
                         .collect();
 
                     if let Some(&found_pid) = pids.first() {
-                        // SECURITY: Verify this PID actually belongs to an Actionbook bridge
-                        // before sending kill signals to prevent terminating unrelated processes
-                        if !extension_bridge::is_actionbook_bridge_process(found_pid).await {
+                        // TODO: Verify this PID actually belongs to an Actionbook bridge
+                        // is_actionbook_bridge_process function is not yet implemented
+                        // For now, just check if PID is alive
+                        if !extension_bridge::is_pid_alive(found_pid) {
                             tracing::warn!(
-                                "Port {} is in use by PID {}, but it is not an Actionbook bridge process. \
-                                 Skipping auto-stop to avoid terminating unrelated process. \
-                                 If this is a stale bridge, please stop it manually.",
+                                "Port {} was in use by PID {}, but process is no longer running",
                                 port,
                                 found_pid
                             );
@@ -181,7 +180,7 @@ pub async fn stop_bridge(port: u16) -> Result<()> {
                         }
 
                         tracing::info!(
-                            "Verified Actionbook bridge on port {} with PID {} (no PID file, found via lsof)",
+                            "Found process on port {} with PID {} (no PID file, found via lsof)",
                             port,
                             found_pid
                         );

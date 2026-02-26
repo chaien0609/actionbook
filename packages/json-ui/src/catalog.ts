@@ -37,6 +37,7 @@ export const SizeType = z.enum(['sm', 'md', 'lg']);
 export const ReportSchema = z.object({
   title: I18nString.optional(),
   theme: ThemeType.default('auto'),
+  showLanguageSwitcher: z.boolean().optional(),
 });
 
 export const SectionSchema = z.object({

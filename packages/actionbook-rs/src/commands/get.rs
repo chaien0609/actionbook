@@ -12,8 +12,18 @@ pub async fn run(cli: &Cli, area_id: &str) -> Result<()> {
 
     let result = client.get_action_by_area_id(area_id).await?;
 
-    // Result is plain text, output directly
-    println!("{}", result);
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "success": true,
+                "area_id": area_id,
+                "result": result,
+            })
+        );
+    } else {
+        println!("{}", result);
+    }
 
     Ok(())
 }

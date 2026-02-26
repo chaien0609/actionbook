@@ -26,5 +26,8 @@
     "overrides": {
       "@neondatabase/serverless": "^0.10.4"
     }
+  },
+  "dependencies": {
+    "@types/dom-chromium-ai": "^0.0.14"
   }
 }

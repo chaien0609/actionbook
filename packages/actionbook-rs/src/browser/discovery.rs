@@ -181,21 +181,46 @@ fn get_browser_candidates() -> Vec<(BrowserType, Vec<&'static str>)> {
     }
 }
 
-/// Detect browser version
+/// Detect browser version with a timeout to prevent hangs.
+/// Some browsers (e.g., Arc) don't support --version and hang instead.
 fn detect_version(path: &PathBuf) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
+    use std::process::Stdio;
 
-    if output.status.success() {
-        let version = String::from_utf8_lossy(&output.stdout);
-        // Extract version number from output like "Google Chrome 120.0.6099.109"
-        let version = version.trim();
-        // Try to extract just the version number
-        if let Some(idx) = version.rfind(' ') {
-            return Some(version[idx + 1..].to_string());
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    // Wait up to 3 seconds for the version output
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(3);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let output = child.wait_with_output().ok()?;
+                    let version = String::from_utf8_lossy(&output.stdout);
+                    let version = version.trim();
+                    if let Some(idx) = version.rfind(' ') {
+                        return Some(version[idx + 1..].to_string());
+                    }
+                    return Some(version.to_string());
+                }
+                return None;
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
         }
-        Some(version.to_string())
-    } else {
-        None
     }
 }
 

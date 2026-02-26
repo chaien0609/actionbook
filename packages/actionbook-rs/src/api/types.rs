@@ -172,3 +172,30 @@ pub struct ApiErrorResponse {
     pub message: String,
     pub code: Option<String>,
 }
+
+// ============================================
+// Structured area action types (for execute/validate/act commands)
+// ============================================
+
+/// A single element within an area action
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AreaElement {
+    pub css_selector: Option<String>,
+    pub xpath_selector: Option<String>,
+    pub description: Option<String>,
+    pub element_type: Option<String>,
+    #[serde(default)]
+    pub allow_methods: Vec<String>,
+}
+
+/// Structured area action detail for execute/validate commands
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AreaActionDetail {
+    pub area_id: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub elements: HashMap<String, AreaElement>,
+}

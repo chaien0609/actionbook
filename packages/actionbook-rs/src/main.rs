@@ -40,7 +40,20 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     if let Err(e) = cli.run().await {
-        eprintln!("Error: {}", e);
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": false,
+                    "error": {
+                        "code": e.error_code(),
+                        "message": e.to_string(),
+                    }
+                })
+            );
+        } else {
+            eprintln!("Error: {}", e);
+        }
         std::process::exit(1);
     }
     Ok(())
