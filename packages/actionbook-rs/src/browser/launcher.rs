@@ -78,6 +78,41 @@ fn find_free_port() -> Option<u16> {
         .map(|addr| addr.port())
 }
 
+/// Strip deprecated Chrome flags that trigger the "unsupported command-line flag" warning.
+///
+/// - `--disable-blink-features=AutomationControlled`: remove only the `AutomationControlled`
+///   token; preserve other comma-separated tokens. Drop the arg entirely when no tokens remain.
+/// - `--disable-infobars` (with or without `=<value>`): drop entirely.
+fn sanitize_deprecated_flags(args: &mut Vec<String>) {
+    const BLINK_PREFIX: &str = "--disable-blink-features=";
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+
+        // Handle --disable-infobars and --disable-infobars=<value>
+        if arg == "--disable-infobars" || arg.starts_with("--disable-infobars=") {
+            args.remove(i);
+            continue;
+        }
+
+        // Handle --disable-blink-features=...
+        if let Some(value) = arg.strip_prefix(BLINK_PREFIX) {
+            let filtered: Vec<&str> = value
+                .split(',')
+                .filter(|token| *token != "AutomationControlled")
+                .collect();
+            if filtered.is_empty() {
+                args.remove(i);
+                continue;
+            }
+            args[i] = format!("{}{}", BLINK_PREFIX, filtered.join(","));
+        }
+
+        i += 1;
+    }
+}
+
 /// Browser launcher that starts a browser with CDP enabled
 pub struct BrowserLauncher {
     browser_info: BrowserInfo,
@@ -231,7 +266,7 @@ impl BrowserLauncher {
         args.extend(self.extra_args.clone());
 
         // Strip deprecated flags that trigger Chrome's "unsupported command-line flag" warning
-        args.retain(|a| !a.contains("AutomationControlled") && a != "--disable-infobars");
+        sanitize_deprecated_flags(&mut args);
 
         args
     }
@@ -680,5 +715,51 @@ mod tests {
             args.contains(&"--lang=en-US".to_string()),
             "non-deprecated extra args must be preserved"
         );
+    }
+
+    #[test]
+    fn sanitize_mixed_blink_features_preserves_other_tokens() {
+        let mut args = vec![
+            "--disable-blink-features=TranslateUI,AutomationControlled,Foo".to_string(),
+        ];
+        sanitize_deprecated_flags(&mut args);
+        assert_eq!(args, vec!["--disable-blink-features=TranslateUI,Foo"]);
+    }
+
+    #[test]
+    fn sanitize_single_token_blink_feature_removes_arg() {
+        let mut args = vec![
+            "--disable-blink-features=AutomationControlled".to_string(),
+            "--lang=en-US".to_string(),
+        ];
+        sanitize_deprecated_flags(&mut args);
+        assert_eq!(args, vec!["--lang=en-US"]);
+    }
+
+    #[test]
+    fn sanitize_unrelated_arg_with_substring_remains() {
+        let mut args = vec![
+            "--my-flag=AutomationControlled".to_string(),
+            "--some-AutomationControlled-thing".to_string(),
+        ];
+        sanitize_deprecated_flags(&mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--my-flag=AutomationControlled",
+                "--some-AutomationControlled-thing",
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_disable_infobars_variants_removed() {
+        let mut args = vec![
+            "--disable-infobars".to_string(),
+            "--disable-infobars=true".to_string(),
+            "--keep-me".to_string(),
+        ];
+        sanitize_deprecated_flags(&mut args);
+        assert_eq!(args, vec!["--keep-me"]);
     }
 }
