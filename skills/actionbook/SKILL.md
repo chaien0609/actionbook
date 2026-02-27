@@ -361,6 +361,16 @@ actionbook --wait-hint <hint> <command>          # Domain-aware wait (instant/fa
 - The user's real browser is being controlled — avoid destructive actions (clearing all cookies, closing all tabs) without confirmation
 - L3 operations (some cookie/storage modifications) may require manual approval in the extension popup
 
+### Login Page Handling
+When you hit a login/auth wall (sign-in page, password prompt, MFA/OTP, CAPTCHA, account chooser):
+
+1. **Pause automation and keep the current browser session open** (same tab/profile/cookies).
+2. **Ask the user to complete login manually** in that same browser window.
+3. After user confirms login is done, **continue in the same session**.
+4. If login lands on a different page type, rerun Phase 1 (`search` → `get`) for that new page type before further commands.
+
+Do not switch tools just because a login page appears.
+
 ### Browser Lifecycle
 Always clean up when the task is complete:
 - **CDP mode:** Run `actionbook browser close` as the final step
