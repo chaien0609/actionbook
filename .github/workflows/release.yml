@@ -345,19 +345,21 @@ jobs:
 
       - name: Generate SHA256 checksums for CLI binaries
         run: |
-          EXPECTED_BINARIES=(
-            "artifacts/actionbook-darwin-arm64/actionbook-darwin-arm64"
-            "artifacts/actionbook-darwin-x64/actionbook-darwin-x64"
-            "artifacts/actionbook-linux-x64/actionbook-linux-x64"
-            "artifacts/actionbook-linux-arm64/actionbook-linux-arm64"
-            "artifacts/actionbook-win32-x64/actionbook-win32-x64.exe"
-            "artifacts/actionbook-win32-arm64/actionbook-win32-arm64.exe"
+          EXPECTED_ASSETS=(
+            "actionbook-darwin-arm64"
+            "actionbook-darwin-x64"
+            "actionbook-linux-x64"
+            "actionbook-linux-arm64"
+            "actionbook-win32-x64.exe"
+            "actionbook-win32-arm64.exe"
           )
 
           missing=0
-          for binary in "${EXPECTED_BINARIES[@]}"; do
-            if [[ ! -f "$binary" ]]; then
-              echo "ERROR: Expected binary not found: $binary"
+          for asset in "${EXPECTED_ASSETS[@]}"; do
+            artifact_dir="${asset%.exe}"
+            binary_path="artifacts/${artifact_dir}/${asset}"
+            if [[ ! -f "$binary_path" ]]; then
+              echo "ERROR: Expected binary not found: $binary_path"
               missing=$((missing + 1))
             fi
           done
@@ -367,9 +369,13 @@ jobs:
           fi
 
           mkdir -p artifacts/checksums
-          for binary in "${EXPECTED_BINARIES[@]}"; do
-            sha256sum "$binary"
-          done | tee artifacts/checksums/SHA256SUMS
+          : > artifacts/checksums/SHA256SUMS
+          for asset in "${EXPECTED_ASSETS[@]}"; do
+            artifact_dir="${asset%.exe}"
+            binary_path="artifacts/${artifact_dir}/${asset}"
+            checksum=$(sha256sum "$binary_path" | awk '{print $1}')
+            printf '%s  %s\n' "$checksum" "$asset" >> artifacts/checksums/SHA256SUMS
+          done
 
           echo "--- SHA256SUMS ---"
           cat artifacts/checksums/SHA256SUMS
