@@ -157,15 +157,53 @@ fn detect_app(app_def: &AppDefinition) -> Option<ElectronAppInfo> {
 
         // Handle glob patterns (e.g., app-*)
         if path_str.contains('*') {
-            if let Some(parent) = path.parent() {
-                if let Ok(entries) = std::fs::read_dir(parent) {
+            // Find the first path component that contains '*'
+            // and read the parent directory before that component
+            let parts: Vec<&str> = expanded.split(&['/', '\\'][..]).collect();
+            let mut real_parent_parts = Vec::new();
+
+            for part in &parts {
+                if part.contains('*') {
+                    break;
+                }
+                real_parent_parts.push(*part);
+            }
+
+            if !real_parent_parts.is_empty() {
+                let real_parent = real_parent_parts.join(std::path::MAIN_SEPARATOR_STR);
+                let real_parent_path = PathBuf::from(&real_parent);
+
+                // Recursively search for matching executable
+                if let Ok(entries) = std::fs::read_dir(real_parent_path) {
                     for entry in entries.flatten() {
                         let entry_path = entry.path();
-                        if entry_path.is_file()
+
+                        // Try to match the full pattern by checking subdirectories
+                        if entry_path.is_dir() {
+                            // Look for the executable in subdirectories
+                            if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
+                                for sub_entry in sub_entries.flatten() {
+                                    let sub_path = sub_entry.path();
+                                    if sub_path.is_file()
+                                        && sub_path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .map(|n| n.to_lowercase() == app_def.name.to_lowercase() + ".exe")
+                                            .unwrap_or(false)
+                                    {
+                                        return Some(ElectronAppInfo {
+                                            name: app_def.name.to_string(),
+                                            path: sub_path,
+                                            version: None,
+                                        });
+                                    }
+                                }
+                            }
+                        } else if entry_path.is_file()
                             && entry_path
                                 .file_name()
                                 .and_then(|n| n.to_str())
-                                .map(|n| n.to_lowercase().contains("discord"))
+                                .map(|n| n.to_lowercase() == app_def.name.to_lowercase() + ".exe")
                                 .unwrap_or(false)
                         {
                             return Some(ElectronAppInfo {

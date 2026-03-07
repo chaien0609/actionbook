@@ -679,14 +679,58 @@ impl SessionManager {
             ActionbookError::CdpConnectionFailed(format!("WebSocket connection failed: {}", e))
         })?;
 
-        // Send Runtime.evaluate command
-        let cmd = serde_json::json!({
-            "id": 1,
-            "method": "Runtime.evaluate",
-            "params": {
-                "expression": expression,
-                "returnByValue": true
+        // Check if we need to evaluate in a specific frame
+        let frame_id = self.get_current_frame_id(profile_name);
+        let mut execution_context_id: Option<i64> = None;
+
+        if let Some(fid) = &frame_id {
+            // Create isolated world in the target frame to get execution context
+            let create_world_cmd = serde_json::json!({
+                "id": 1,
+                "method": "Page.createIsolatedWorld",
+                "params": {
+                    "frameId": fid
+                }
+            });
+
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                create_world_cmd.to_string().into(),
+            ))
+            .await
+            .map_err(|e| ActionbookError::Other(format!("Failed to send command: {}", e)))?;
+
+            // Read response to get execution context ID
+            use futures::stream::StreamExt;
+            while let Some(msg) = ws.next().await {
+                if let Ok(tokio_tungstenite::tungstenite::Message::Text(text)) = msg {
+                    let response: serde_json::Value = serde_json::from_str(&text)?;
+                    if response.get("id") == Some(&serde_json::json!(1)) {
+                        if let Some(ctx_id) = response.get("result").and_then(|r| r.get("executionContextId")).and_then(|c| c.as_i64()) {
+                            execution_context_id = Some(ctx_id);
+                        }
+                        break;
+                    }
+                }
             }
+        }
+
+        // Send Runtime.evaluate command with optional contextId
+        let mut params = serde_json::json!({
+            "expression": expression,
+            "returnByValue": true
+        });
+
+        if let Some(ctx_id) = execution_context_id {
+            params.as_object_mut().unwrap().insert(
+                "contextId".to_string(),
+                serde_json::json!(ctx_id)
+            );
+        }
+
+        let cmd = serde_json::json!({
+            "id": 2,
+            "method": "Runtime.evaluate",
+            "params": params
         });
 
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -701,7 +745,7 @@ impl SessionManager {
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                     let response: serde_json::Value = serde_json::from_str(text.as_str())?;
-                    if response.get("id") == Some(&serde_json::json!(1)) {
+                    if response.get("id") == Some(&serde_json::json!(2)) {
                         if let Some(result) = response.get("result").and_then(|r| r.get("result")) {
                             if let Some(value) = result.get("value") {
                                 return Ok(value.clone());
@@ -3034,6 +3078,7 @@ impl SessionManager {
 
         None
     }
+
 }
 
 /// Resource blocking level

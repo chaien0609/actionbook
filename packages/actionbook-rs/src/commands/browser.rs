@@ -504,7 +504,9 @@ fn requires_active_session(command: &BrowserCommands) -> bool {
     !matches!(
         command,
         // Read-only commands that can work without active session
-        BrowserCommands::Status | BrowserCommands::Pages
+        BrowserCommands::Status | BrowserCommands::Pages |
+        // Close is safe to call even when no session exists
+        BrowserCommands::Close
     )
 }
 
