@@ -95,6 +95,7 @@ A high-performance CLI for browser automation with zero installation. Built in R
 - **Local Storage Management** - Get, set, remove, clear, and list localStorage/sessionStorage
 - **Device Emulation** - Emulate mobile/tablet devices with preset viewports (iPhone, Pixel, iPad)
 - **Wait for JS Condition** - Poll a JavaScript expression until it returns truthy
+- **Electron App Automation** - Automate desktop apps (VS Code, Slack, Discord, Figma) via `actionbook app` command
 - **Keyboard Hotkeys** - Send keyboard combinations (Ctrl+C, Cmd+A, multi-modifier shortcuts)
 - **Shadow DOM Support** - Interact with elements inside Shadow DOM using `::shadow-root` selector syntax
 - **IFrame Context Switching** - Switch between main frame and iframes for embedded content
@@ -473,6 +474,93 @@ actionbook config set <KEY> <VALUE> # Set config value
 actionbook profile list             # List all profiles
 actionbook profile create <NAME>    # Create new profile
 actionbook profile delete <NAME>    # Delete profile
+```
+
+### `app` - Electron App Automation
+
+Automate desktop applications built with Electron (VS Code, Slack, Discord, Figma, Notion, Spotify, etc.) using Chrome DevTools Protocol.
+
+**App-Specific Commands:**
+
+```bash
+actionbook app launch <NAME>        # Auto-discover and launch Electron app
+actionbook app attach <PORT>        # Attach to running app on CDP port
+actionbook app list                 # List all discoverable Electron apps
+actionbook app status               # Show current app connection status
+actionbook app close                # Close the connected app
+actionbook app restart              # Restart the app (preserves session)
+```
+
+**All Browser Commands Available:**
+
+Every `browser` command works with `app` prefix (35+ commands):
+
+```bash
+# Navigation
+actionbook app goto <URL>
+
+# Interaction
+actionbook app click <SELECTOR>
+actionbook app type <TEXT> [SELECTOR]
+actionbook app fill <TEXT> [SELECTOR]
+actionbook app hotkey "Control+C"
+
+# Analysis
+actionbook app snapshot [--format compact]
+actionbook app screenshot output.png
+actionbook app eval "document.title"
+
+# Tab management
+actionbook app tab list
+actionbook app tab new
+actionbook app tab switch <PAGE_ID>
+```
+
+**Example Workflows:**
+
+```bash
+# Automate VS Code
+actionbook app launch "Visual Studio Code"
+actionbook app hotkey "Cmd+Shift+P"      # Open command palette
+actionbook app type "Git: Commit"
+actionbook app hotkey "Enter"
+
+# Automate Slack
+actionbook app launch Slack
+actionbook app click "#channel-name"
+actionbook app type "Hello team!" "div[role='textbox']"
+actionbook app hotkey "Enter"
+
+# Automate Figma
+actionbook app attach 9222               # If Figma already running with --remote-debugging-port=9222
+actionbook app click "button:has-text('Export')"
+actionbook app screenshot design.png
+```
+
+**Supported Apps:**
+
+| App | macOS | Linux | Windows |
+|-----|-------|-------|---------|
+| Visual Studio Code | ✅ | ✅ | ✅ |
+| Slack | ✅ | ✅ | ✅ |
+| Discord | ✅ | ✅ | ✅ |
+| Figma | ✅ | ✅ | ✅ |
+| Notion | ✅ | ✅ | ✅ |
+| Spotify | ✅ | ✅ | ✅ |
+| Any Electron App | ✅ | ✅ | ✅ |
+
+**How It Works:**
+
+1. **Auto-Discovery**: Scans common install locations for Electron apps
+2. **CDP Launch**: Starts app with `--remote-debugging-port=9222`
+3. **Session Tracking**: Stores app path for restart preservation
+4. **Full Feature Parity**: All browser automation features work (Shadow DOM, iframes, hotkeys, etc.)
+
+**Port Inference:**
+
+```bash
+# If app already running with CDP enabled
+actionbook app attach 9222              # Validates CDP endpoint and matches against known apps
 ```
 
 ## Stealth Mode
