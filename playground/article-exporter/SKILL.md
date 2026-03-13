@@ -2,11 +2,11 @@
 # === Both Claude Code and Codex read these ===
 name: article-exporter
 description: >
-  Export web articles and social posts to clean Obsidian
-  Markdown with image downloads and optional AI translation.
-  Use when the user wants to save, archive, or convert an
-  online article, blog post, or social thread into a local
-  Markdown knowledge base.
+  Export any web article to a local Obsidian-ready Markdown directory.
+  Fetches page content via actionbook CLI, downloads images locally,
+  rewrites image references to relative paths, and optionally translates
+  the article using AI. Produces a self-contained folder with README.md,
+  images/, and an index.md navigation file.
 
 # === Claude Code specific (Codex ignores, no side effects) ===
 when_to_use: >
@@ -14,8 +14,6 @@ when_to_use: >
   or social thread into Obsidian or a Markdown knowledge base.
   Also use when the user asks to archive, translate, or convert
   web content into clean Markdown with images downloaded locally.
-  Supported sources include Medium, Dev.to, Substack, OpenAI blog,
-  X/Twitter, and general web pages.
 allowed-tools:
   - Read
   - Write
@@ -29,7 +27,7 @@ arguments:
 
 # Article Exporter - Export Articles to Obsidian
 
-> **Version:** 0.4.0 | **Last Updated:** 2026-03-13
+> **Version:** 0.5.0 | **Last Updated:** 2026-03-13
 
 You are an expert at web content archiving and Obsidian workflow automation.
 
@@ -48,7 +46,7 @@ These rules were extracted from real export failures. Each one prevents a specif
 | Task | Command | Success Criteria |
 |------|---------|------------------|
 | Check deps | `actionbook --version` | Shows version >= 0.9.1 |
-| Fetch article | `actionbook browser fetch <url> --wait-hint heavy` | Returns readability text (AI converts to Markdown) |
+| Fetch article | `actionbook browser fetch <url> --wait-hint heavy` | Returns plain text (AI reformats to Markdown in Step 1b) |
 | Translate | AI session directly | README_CN.md created |
 | Open in Obsidian | `obsidian-cli open "path/index.md"` | File opens in Obsidian |
 
@@ -81,9 +79,8 @@ actionbook browser fetch "$URL" --wait-hint heavy 2>/dev/null | \
 - `/tmp/article_raw.txt` exists and size > 0 bytes
 - Content contains the article's main text
 
-The fetch command returns readability-extracted plain text (not Markdown).
-AI reformatting is always needed to produce proper Markdown with headings,
-lists, code blocks, and image references.
+The fetch command returns readability-extracted **plain text** (not Markdown).
+AI reformatting in Step 1b is always needed to produce proper Markdown.
 
 **Rules:**
 - Use `--wait-hint heavy` for Twitter, Medium, dynamic content
@@ -93,10 +90,25 @@ lists, code blocks, and image references.
 
 **Twitter/X Special Handling**
 
-Twitter uses non-semantic HTML, so `fetch` output loses all structure (headings become flat text, code blocks disappear). If the URL contains `x.com` or `twitter.com`:
-1. Save fetch output to `/tmp/article_raw.md`
-2. Use AI to reformat into proper Markdown (see `references/twitter-handling.md`)
-3. Then continue from Step 2 with the reformatted content
+Twitter uses non-semantic HTML, so `fetch` output loses all structure (headings become flat text, code blocks disappear). If the URL contains `x.com` or `twitter.com`, pay extra attention to structure reconstruction in Step 1b. See `references/twitter-handling.md`.
+
+---
+
+### Step 1b: AI Reformat to Markdown
+
+**Execution:** Direct (AI session)
+
+Read `/tmp/article_raw.txt` and convert the plain text into well-structured Markdown. Save the result to `/tmp/article.md`.
+
+**Reformatting rules:**
+- Reconstruct headings (`#`, `##`, `###`) from the text structure
+- Preserve original image URLs as `![alt](url)` references
+- Format code blocks, lists, tables, and blockquotes
+- Keep the original article title as the first `# H1` heading
+
+**Success criteria:**
+- `/tmp/article.md` exists and starts with `# <Title>`
+- Image URLs are preserved as Markdown image syntax
 
 ---
 
@@ -105,7 +117,7 @@ Twitter uses non-semantic HTML, so `fetch` output loses all structure (headings 
 **Execution:** Direct (Bash)
 
 ```bash
-# Extract title (first H1 heading)
+# Extract title (first H1 heading from AI-reformatted markdown)
 TITLE=$(grep -m 1 "^# " /tmp/article.md | sed 's/^# //')
 
 # Extract image URLs (filter out data: URLs)
@@ -394,4 +406,4 @@ For detailed documentation, see:
 
 ---
 
-**Last Updated**: 2026-03-13 | **Version**: 0.4.0
+**Last Updated**: 2026-03-13 | **Version**: 0.5.0
