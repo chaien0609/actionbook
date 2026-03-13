@@ -204,12 +204,14 @@ async fn apply_resource_blocking(cli: &Cli, driver: &mut BrowserDriver) {
 /// Resolve a snapshot ref (e.g., "e0") to a backendNodeId by fetching the accessibility tree
 async fn resolve_snapshot_ref(driver: &mut BrowserDriver, ref_str: &str) -> Result<i64> {
     let raw = driver.get_accessibility_tree_raw().await?;
+    // Phase 2b: Convert to JSON string for typed deserialization
+    let raw_json = serde_json::to_string(&raw)?;
     let (_nodes, cache) = crate::browser::snapshot::parse_ax_tree(
-        &raw,
+        &raw_json,
         crate::browser::snapshot::SnapshotFilter::All,
         None,
         None,
-    );
+    )?;
     cache
         .refs
         .get(ref_str)
@@ -2570,7 +2572,9 @@ pub(crate) async fn snapshot(
     };
 
     let raw = driver.get_accessibility_tree_raw().await?;
-    let (mut nodes, _cache) = snapshot::parse_ax_tree(&raw, snap_filter, depth, scope_backend_id);
+    // Phase 2b: Convert to JSON string for typed deserialization
+    let raw_json = serde_json::to_string(&raw)?;
+    let (mut nodes, _cache) = snapshot::parse_ax_tree(&raw_json, snap_filter, depth, scope_backend_id)?;
 
     // Apply compact tree filtering (-c): remove empty structural elements
     if compact {
@@ -3930,7 +3934,7 @@ async fn fetch_via_browser(
     match BrowserDriver::from_config(&fetch_config, &fetch_config.get_profile(&profile_name).unwrap(), &temp_cli).await? {
         BrowserDriver::Cdp(session_mgr) => {
             // Start browser session
-            let (browser, mut handler) = session_mgr.get_or_create_session(Some(&profile_name)).await?;
+            let (_browser, mut handler) = session_mgr.get_or_create_session(Some(&profile_name)).await?;
 
             // Spawn handler in background
             tokio::spawn(async move {
@@ -3996,8 +4000,8 @@ async fn complete_fetch(
     max_tokens: Option<usize>,
     session_tag: &str,
     cli: &Cli,
-    profile_name: String,
-    config: Config,
+    _profile_name: String,
+    _config: Config,
 ) -> Result<()> {
 
     // I5: Domain-aware wait
@@ -4017,12 +4021,14 @@ async fn complete_fetch(
     let (content, content_format, tokens_estimate, truncated) = match format {
         "snapshot" => {
             let raw = driver.get_accessibility_tree_raw().await?;
+            // Phase 2b: Convert to JSON string for typed deserialization
+            let raw_json = serde_json::to_string(&raw)?;
             let (nodes, _cache) = crate::browser::snapshot::parse_ax_tree(
-                &raw,
+                &raw_json,
                 crate::browser::snapshot::SnapshotFilter::All,
                 None,
                 None,
-            );
+            )?;
 
             let (final_nodes, was_truncated) = if let Some(max) = max_tokens {
                 crate::browser::snapshot::truncate_to_tokens(
@@ -5158,7 +5164,6 @@ mod tests {
     };
     use crate::cli::{BrowserCommands, BrowserMode, Cli, Commands};
     use crate::config::Config;
-    use serde_json::json;
 
     fn test_cli(profile: Option<&str>, command: BrowserCommands) -> Cli {
         Cli {
