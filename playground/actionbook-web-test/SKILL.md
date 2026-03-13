@@ -556,12 +556,12 @@ The agent should generate a JSON document following this structure:
           "props": {
             "numbered": true,
             "items": [
-              { "text": "Open Google", "badge": "PASS", "description": "`browser open https://google.com` (0.5s)" },
-              { "text": "Verify search box", "badge": "PASS", "description": "`browser wait \"input[name='q']\"` (0.3s)" },
-              { "text": "Fill search query", "badge": "PASS", "description": "`browser fill \"input[name='q']\" \"actionbook\"` (0.2s)" },
-              { "text": "Submit search", "badge": "PASS", "description": "`browser press Enter` (0.1s)" },
-              { "text": "Verify results loaded", "badge": "PASS", "description": "`browser wait \"#search\"` (1.5s)" },
-              { "text": "Verify result count", "badge": "PASS", "description": "assert element-count >= 5 (0.6s)" }
+              { "title": "Open Google", "badge": "PASS", "description": "`browser open https://google.com` (0.5s)" },
+              { "title": "Verify search box", "badge": "PASS", "description": "`browser wait \"input[name='q']\"` (0.3s)" },
+              { "title": "Fill search query", "badge": "PASS", "description": "`browser fill \"input[name='q']\" \"actionbook\"` (0.2s)" },
+              { "title": "Submit search", "badge": "PASS", "description": "`browser press Enter` (0.1s)" },
+              { "title": "Verify results loaded", "badge": "PASS", "description": "`browser wait \"#search\"` (1.5s)" },
+              { "title": "Verify result count", "badge": "PASS", "description": "assert element-count >= 5 (0.6s)" }
             ]
           }
         },
@@ -592,13 +592,13 @@ The agent should generate a JSON document following this structure:
           "props": {
             "numbered": true,
             "items": [
-              { "text": "Open login page", "badge": "PASS", "description": "`browser open https://app.example.com/login` (0.8s)" },
-              { "text": "Fill username", "badge": "PASS", "description": "`browser fill \"#email\" \"test@example.com\"` (0.2s)" },
-              { "text": "Fill password", "badge": "PASS", "description": "`browser fill \"#password\" \"***\"` (0.1s)" },
-              { "text": "Click submit", "badge": "FAIL", "description": "`browser click \"button[type='submit']\"` — Selector not found" },
-              { "text": "Verify redirect to dashboard", "badge": "SKIP", "description": "Skipped due to previous failure" },
-              { "text": "Check welcome message", "badge": "SKIP", "description": "Skipped due to previous failure" },
-              { "text": "Close browser", "badge": "SKIP", "description": "Skipped due to previous failure" }
+              { "title": "Open login page", "badge": "PASS", "description": "`browser open https://app.example.com/login` (0.8s)" },
+              { "title": "Fill username", "badge": "PASS", "description": "`browser fill \"#email\" \"test@example.com\"` (0.2s)" },
+              { "title": "Fill password", "badge": "PASS", "description": "`browser fill \"#password\" \"***\"` (0.1s)" },
+              { "title": "Click submit", "badge": "FAIL", "description": "`browser click \"button[type='submit']\"` — Selector not found" },
+              { "title": "Verify redirect to dashboard", "badge": "SKIP", "description": "Skipped due to previous failure" },
+              { "title": "Check welcome message", "badge": "SKIP", "description": "Skipped due to previous failure" },
+              { "title": "Close browser", "badge": "SKIP", "description": "Skipped due to previous failure" }
             ]
           }
         },
@@ -723,11 +723,11 @@ Every test (PASS, FAIL, or SKIP) gets its own collapsible `Section` in the repor
       "props": {
         "numbered": true,
         "items": [
-          { "text": "Open login page", "badge": "PASS", "description": "browser open https://app.example.com/login (0.8s)" },
-          { "text": "Fill username", "badge": "PASS", "description": "browser fill \"#email\" \"test@example.com\" (0.2s)" },
-          { "text": "Fill password", "badge": "PASS", "description": "browser fill \"#password\" \"***\" (0.1s)" },
-          { "text": "Click submit", "badge": "FAIL", "description": "browser click \"button[type='submit']\" — Selector not found" },
-          { "text": "Verify redirect to dashboard", "badge": "SKIP", "description": "Skipped due to previous failure" }
+          { "title": "Open login page", "badge": "PASS", "description": "browser open https://app.example.com/login (0.8s)" },
+          { "title": "Fill username", "badge": "PASS", "description": "browser fill \"#email\" \"test@example.com\" (0.2s)" },
+          { "title": "Fill password", "badge": "PASS", "description": "browser fill \"#password\" \"***\" (0.1s)" },
+          { "title": "Click submit", "badge": "FAIL", "description": "browser click \"button[type='submit']\" — Selector not found" },
+          { "title": "Verify redirect to dashboard", "badge": "SKIP", "description": "Skipped due to previous failure" }
         ]
       }
     },

@@ -237,7 +237,7 @@ const testSection = {
       props: {
         numbered: true,
         items: result.steps.map(step => ({
-          text: step.name,
+          title: step.name,
           badge: step.status === "passed" ? "PASS" :
                  step.status === "failed" ? "FAIL" : "SKIP",
           description: step.cli_command
@@ -388,9 +388,9 @@ For a single test with 3 passing steps:
           "props": {
             "numbered": true,
             "items": [
-              { "text": "Open homepage", "badge": "PASS", "description": "`browser open https://example.com` (0.5s)" },
-              { "text": "Verify heading", "badge": "PASS", "description": "assert text-contains \"Welcome\" (0.3s)" },
-              { "text": "Verify footer", "badge": "PASS", "description": "`browser wait \"footer\"` (0.1s)" }
+              { "title": "Open homepage", "badge": "PASS", "description": "`browser open https://example.com` (0.5s)" },
+              { "title": "Verify heading", "badge": "PASS", "description": "assert text-contains \"Welcome\" (0.3s)" },
+              { "title": "Verify footer", "badge": "PASS", "description": "`browser wait \"footer\"` (0.1s)" }
             ]
           }
         },
@@ -478,12 +478,12 @@ For 2 tests (1 pass, 1 fail with screenshot):
           "props": {
             "numbered": true,
             "items": [
-              { "text": "Open homepage", "badge": "PASS", "description": "`browser open https://app.example.com` (0.5s)" },
-              { "text": "Verify hero section", "badge": "PASS", "description": "`browser wait \".hero\"` (0.3s)" },
-              { "text": "Verify nav links", "badge": "PASS", "description": "assert element-count >= 4 (0.2s)" },
-              { "text": "Verify CTA button", "badge": "PASS", "description": "`browser wait \"a.cta-button\"` (0.1s)" },
-              { "text": "Check no JS errors", "badge": "PASS", "description": "`browser console --level error` (0.5s)" },
-              { "text": "Verify footer", "badge": "PASS", "description": "`browser wait \"footer\"` (0.1s)" }
+              { "title": "Open homepage", "badge": "PASS", "description": "`browser open https://app.example.com` (0.5s)" },
+              { "title": "Verify hero section", "badge": "PASS", "description": "`browser wait \".hero\"` (0.3s)" },
+              { "title": "Verify nav links", "badge": "PASS", "description": "assert element-count >= 4 (0.2s)" },
+              { "title": "Verify CTA button", "badge": "PASS", "description": "`browser wait \"a.cta-button\"` (0.1s)" },
+              { "title": "Check no JS errors", "badge": "PASS", "description": "`browser console --level error` (0.5s)" },
+              { "title": "Verify footer", "badge": "PASS", "description": "`browser wait \"footer\"` (0.1s)" }
             ]
           }
         },
@@ -514,13 +514,13 @@ For 2 tests (1 pass, 1 fail with screenshot):
           "props": {
             "numbered": true,
             "items": [
-              { "text": "Open login page", "badge": "PASS", "description": "`browser open https://app.example.com/login` (0.8s)" },
-              { "text": "Fill username", "badge": "PASS", "description": "`browser fill \"#email\" \"test@example.com\"` (0.2s)" },
-              { "text": "Fill password", "badge": "PASS", "description": "`browser fill \"#password\" \"***\"` (0.1s)" },
-              { "text": "Click submit", "badge": "FAIL", "description": "`browser click \"button[type='submit']\"` — Selector not found" },
-              { "text": "Verify dashboard redirect", "badge": "SKIP", "description": "Skipped due to previous failure" },
-              { "text": "Check welcome message", "badge": "SKIP", "description": "Skipped due to previous failure" },
-              { "text": "Close browser", "badge": "SKIP", "description": "Skipped due to previous failure" }
+              { "title": "Open login page", "badge": "PASS", "description": "`browser open https://app.example.com/login` (0.8s)" },
+              { "title": "Fill username", "badge": "PASS", "description": "`browser fill \"#email\" \"test@example.com\"` (0.2s)" },
+              { "title": "Fill password", "badge": "PASS", "description": "`browser fill \"#password\" \"***\"` (0.1s)" },
+              { "title": "Click submit", "badge": "FAIL", "description": "`browser click \"button[type='submit']\"` — Selector not found" },
+              { "title": "Verify dashboard redirect", "badge": "SKIP", "description": "Skipped due to previous failure" },
+              { "title": "Check welcome message", "badge": "SKIP", "description": "Skipped due to previous failure" },
+              { "title": "Close browser", "badge": "SKIP", "description": "Skipped due to previous failure" }
             ]
           }
         },

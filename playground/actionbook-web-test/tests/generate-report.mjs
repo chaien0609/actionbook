@@ -219,7 +219,7 @@ function buildTestDetailSections(tests, baseDir) {
         props: {
           numbered: true,
           items: t.steps.map(s => ({
-            text: s.name,
+            title: s.name,
             badge: statusBadge(s.status),
             description: buildStepDescription(s),
           })),
@@ -261,12 +261,49 @@ function buildFooter(timestamp) {
 
 // ── CLI ──
 
+function writeExampleData(outputFile) {
+  const example = {
+    environment: {
+      timestamp: new Date().toISOString(),
+      browser: 'Chromium 125.0 (extension mode)',
+      viewport: '1280x720',
+      profile: 'default',
+      target: 'https://example.com',
+    },
+    tests: [
+      {
+        name: 'example-smoke',
+        status: 'passed',
+        duration: 3200,
+        tags: ['smoke', 'example'],
+        summary: 'Verify example.com loads with expected content.',
+        steps: [
+          { name: 'Open page', status: 'passed', command: 'browser open https://example.com', duration: 800 },
+          { name: 'Verify heading', status: 'passed', command: null, duration: 200, assertion: true },
+          { name: 'Verify links', status: 'passed', command: null, duration: 150, assertion: true },
+        ],
+      },
+    ],
+  }
+  const outPath = resolve(process.cwd(), outputFile)
+  writeFileSync(outPath, JSON.stringify(example, null, 2))
+  console.log(`Example data written to ${outPath}`)
+}
+
 function main() {
   const args = process.argv.slice(2)
+
+  if (args.includes('--example')) {
+    const outputIdx = args.indexOf('-o')
+    const outputFile = outputIdx !== -1 ? args[outputIdx + 1] : 'example-result.json'
+    writeExampleData(outputFile)
+    return
+  }
 
   const inputFile = args.find(a => !a.startsWith('-'))
   if (!inputFile) {
     console.error('Usage: node generate-report.mjs <execution-result.json> [-o output.json]')
+    console.error('       node generate-report.mjs --example [-o output.json]')
     console.error('')
     console.error('Execution result JSON format:')
     console.error('  {')
